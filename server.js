@@ -118,27 +118,45 @@ async function handleCreateAssignment(body) {
   if (!teacherEmail || !courseId || !title) return { error: 'Липсва teacherEmail/courseId/title.' };
   const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
   let topicId = null;
-  try {
-    topicId = await resolveTopicId_(classroom, courseId, topicName);
-  } catch (e) {
-    return { error: 'Грешка при темата "' + topicName + '": ' + describeApiError_(e) };
+  let resolvedTopicName = null;
+  if ((topicName || '').trim()) {
+    try {
+      topicId = await resolveTopicId_(classroom, courseId, topicName);
+      resolvedTopicName = (topicName || '').trim();
+    } catch (e) {
+      // Темата е "по избор" - 2026-11-07, открито при реален тест
+      // ("Insufficient Permission" на courses.topics.* с неизяснена точна
+      // причина, въпреки че Classroom API документацията изброява СЪЩИЯ
+      // scope като за courseWork.create/list) - не искаме да провалим
+      // ЦЯЛОТО създаване на заданието заради проблем само с темата -
+      // създаваме БЕЗ тема вместо да спрем всичко.
+      console.error('[createAssignment] неуспешно задаване на тема (продължавам без тема):', describeApiError_(e));
+    }
   }
   const result = await classroom.courses.courseWork.create({
     courseId,
     requestBody: { title, description: description || undefined, workType: 'ASSIGNMENT', state: 'PUBLISHED', topicId: topicId || undefined },
   });
-  return { ok: true, courseWorkId: result.data.id, topicId: topicId, topicName: topicId ? (topicName || '').trim() : null };
+  return { ok: true, courseWorkId: result.data.id, topicId: topicId, topicName: topicId ? resolvedTopicName : null };
 }
 
 // Връща темите, вече създадени в курса - за падащото меню "Тема" при ново
 // задание (free-form избор измежду вече съществуващите, виж резюмето по-горе).
+// Деградира тихо до празен списък при грешка (виж бележката в
+// handleCreateAssignment защо) - учителят пак може да въведе "+ нова тема...",
+// просто без списък от съществуващи за избор.
 async function handleListTopics(body) {
   const { teacherEmail, courseId } = body;
   if (!teacherEmail || !courseId) return { error: 'Липсва teacherEmail/courseId.' };
   const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
-  const list = await classroom.courses.topics.list({ courseId });
-  const topics = (list.data.topic || []).map((t) => ({ topicId: t.topicId, name: t.name }));
-  return { ok: true, topics: topics };
+  try {
+    const list = await classroom.courses.topics.list({ courseId });
+    const topics = (list.data.topic || []).map((t) => ({ topicId: t.topicId, name: t.name }));
+    return { ok: true, topics: topics };
+  } catch (e) {
+    console.error('[listTopics] неуспешно четене на теми:', describeApiError_(e));
+    return { ok: true, topics: [] };
+  }
 }
 
 // Google API грешките носят полезни детайли в e.errors[] (reason/domain),
@@ -376,12 +394,27 @@ async function handleListCourseWork(body) {
   const { teacherEmail, courseId } = body;
   if (!teacherEmail || !courseId) return { error: 'Липсва teacherEmail/courseId.' };
   const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
-  const [topicsRes, courseWorkRes] = await Promise.all([
-    classroom.courses.topics.list({ courseId }),
-    classroom.courses.courseWork.list({ courseId, courseWorkStates: ['PUBLISHED'] }),
-  ]);
-  const topicNameById = {};
-  (topicsRes.data.topic || []).forEach((t) => { topicNameById[t.topicId] = t.name; });
+
+  let courseWorkRes;
+  try {
+    courseWorkRes = await classroom.courses.courseWork.list({ courseId, courseWorkStates: ['PUBLISHED'] });
+  } catch (e) {
+    return { error: 'Грешка при четене на заданията: ' + describeApiError_(e) };
+  }
+
+  // Темите са само за ГРУПИРАНЕ в менюто - 2026-11-07, открито при реален
+  // тест ("Insufficient Permission" на courses.topics.list, причината не е
+  // напълно изяснена - виж бележката в handleCreateAssignment). Ако тази
+  // заявка гръмне, показваме ЗАДАНИЯТА БЕЗ теми (всички в "Без тема"),
+  // вместо да провалим ЦЯЛОТО меню заради проблем само с групирането.
+  let topicNameById = {};
+  try {
+    const topicsRes = await classroom.courses.topics.list({ courseId });
+    (topicsRes.data.topic || []).forEach((t) => { topicNameById[t.topicId] = t.name; });
+  } catch (e) {
+    console.error('[listCourseWork] неуспешно четене на теми (продължавам без групиране):', describeApiError_(e));
+  }
+
   const items = (courseWorkRes.data.courseWork || []).map((cw) => ({
     courseWorkId: cw.id,
     title: cw.title,
