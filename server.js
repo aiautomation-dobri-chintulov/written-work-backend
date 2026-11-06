@@ -359,29 +359,38 @@ async function handleUpdateAnnotated(body) {
   return { ok: true };
 }
 
-// Проверява кои от подадените courseWorkId все още СЪЩЕСТВУВАТ (не DELETED) -
-// 2026-11-07, по изрично искане на потребителя: историята (written-work-jobs)
-// трупа записи от ВСЕКИ опит, включително стари/изтрити задания от по-ранни
-// тестове със СЪЩОТО заглавие+клас (объркващо в падащите менюта - учителят
-// лесно избира изтрит ID по погрешка, API-то връща неясен "failedPrecondition"
-// вместо ясно "изтрито"). Dashboard-ът филтрира с това резултата ПРЕДИ да
-// покаже падащото меню.
-async function handleCheckCourseWorks(body) {
-  const { teacherEmail, courseId, courseWorkIds } = body;
-  if (!teacherEmail || !courseId || !Array.isArray(courseWorkIds)) {
-    return { error: 'Липсват задължителни полета.' };
-  }
+// Списък на РЕАЛНИТЕ Classroom задания в курса, групирани по тема - 2026-11-07
+// вечерта, ЗАМЕНЯ по-ранния подход (четене на written-work-jobs manifest
+// история в Drive, виж handleCheckCourseWorks - премахнат оттук). Открито при
+// реален случай: "при домашна работа се показва само 'без тема', има и
+// домашна работа за 6б, която изобщо не се показва" - домашните (за разлика
+// от писмените/контролните) обикновено се създават ДИРЕКТНО в Classroom от
+// учителя, не през този дашборд, затова нямат manifest файл в историята и
+// никога не са се появявали в по-ранните падащи менюта (четяха САМО нашата
+// история, не самия Classroom). Четенето директно от Classroom API
+// (courses.courseWork.list + courses.topics.list) е единственият ВЯРЕН
+// източник - показва ВСЯКО задание в курса с РЕАЛНАТА му Classroom тема, и
+// елиминира от корен старите проблеми с дублирани/изтрити записи (Classroom
+// пази всяко задание точно веднъж - няма нужда от дедупликация/филтриране).
+async function handleListCourseWork(body) {
+  const { teacherEmail, courseId } = body;
+  if (!teacherEmail || !courseId) return { error: 'Липсва teacherEmail/courseId.' };
   const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
-  const states = {};
-  for (const id of courseWorkIds) {
-    try {
-      const cw = await classroom.courses.courseWork.get({ courseId, id });
-      states[id] = cw.data.state;
-    } catch (e) {
-      states[id] = 'MISSING';
-    }
-  }
-  return { ok: true, states };
+  const [topicsRes, courseWorkRes] = await Promise.all([
+    classroom.courses.topics.list({ courseId }),
+    classroom.courses.courseWork.list({ courseId, courseWorkStates: ['PUBLISHED'] }),
+  ]);
+  const topicNameById = {};
+  (topicsRes.data.topic || []).forEach((t) => { topicNameById[t.topicId] = t.name; });
+  const items = (courseWorkRes.data.courseWork || []).map((cw) => ({
+    courseWorkId: cw.id,
+    title: cw.title,
+    topicId: cw.topicId || null,
+    topicName: cw.topicId ? (topicNameById[cw.topicId] || null) : null,
+    createdAt: cw.creationTime,
+  }));
+  items.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  return { ok: true, items: items };
 }
 
 const app = express();
@@ -401,7 +410,7 @@ app.post('/', async (req, res) => {
     if (body.action === 'submitWork') { res.json(await handleSubmitWork(body)); return; }
     if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
     if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
-    if (body.action === 'checkCourseWorks') { res.json(await handleCheckCourseWorks(body)); return; }
+    if (body.action === 'listCourseWork') { res.json(await handleListCourseWork(body)); return; }
     if (body.action === 'updateAnnotated') { res.json(await handleUpdateAnnotated(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
