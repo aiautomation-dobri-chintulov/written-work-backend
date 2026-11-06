@@ -274,6 +274,31 @@ async function handleGetOriginal(body) {
   }
 }
 
+// Проверява кои от подадените courseWorkId все още СЪЩЕСТВУВАТ (не DELETED) -
+// 2026-11-07, по изрично искане на потребителя: историята (written-work-jobs)
+// трупа записи от ВСЕКИ опит, включително стари/изтрити задания от по-ранни
+// тестове със СЪЩОТО заглавие+клас (объркващо в падащите менюта - учителят
+// лесно избира изтрит ID по погрешка, API-то връща неясен "failedPrecondition"
+// вместо ясно "изтрито"). Dashboard-ът филтрира с това резултата ПРЕДИ да
+// покаже падащото меню.
+async function handleCheckCourseWorks(body) {
+  const { teacherEmail, courseId, courseWorkIds } = body;
+  if (!teacherEmail || !courseId || !Array.isArray(courseWorkIds)) {
+    return { error: 'Липсват задължителни полета.' };
+  }
+  const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
+  const states = {};
+  for (const id of courseWorkIds) {
+    try {
+      const cw = await classroom.courses.courseWork.get({ courseId, id });
+      states[id] = cw.data.state;
+    } catch (e) {
+      states[id] = 'MISSING';
+    }
+  }
+  return { ok: true, states };
+}
+
 const app = express();
 app.use(express.json({ limit: '15mb' })); // снимки/PDF-и като base64 могат да са няколко MB
 
@@ -290,6 +315,7 @@ app.post('/', async (req, res) => {
     if (body.action === 'submitWork') { res.json(await handleSubmitWork(body)); return; }
     if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
     if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
+    if (body.action === 'checkCourseWorks') { res.json(await handleCheckCourseWorks(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
     res.status(500).json({ error: e.message });
