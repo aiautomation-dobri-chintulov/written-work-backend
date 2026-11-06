@@ -269,17 +269,29 @@ async function handleGetOriginal(body) {
   // ВИНАГИ най-актуалната версия (оригинал, ако още няма анотации; иначе
   // последното анотирано копие) - учителят продължава откъдето е спрял,
   // вместо винаги да вижда чист оригинал.
-  const isOriginal = driveAttachments.length === 1;
-  const fileId = driveAttachments[driveAttachments.length - 1].driveFile.id;
-
-  try {
-    const meta = await drive.files.get({ fileId, fields: 'name,mimeType' });
-    const content = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
-    const base64Data = Buffer.from(content.data).toString('base64');
-    return { ok: true, fileName: meta.data.name, mimeType: meta.data.mimeType, base64Data, driveFileId: fileId, isOriginal: isOriginal };
-  } catch (e) {
-    console.error(tag, 'ГРЕШКА при изтегляне на файла:', describeApiError_(e));
-    return { error: 'Грешка при изтегляне на файла: ' + describeApiError_(e) };
+  //
+  // ПАДАНЕ НАЗАД при счупена връзка - 2026-11-07, по изрично искане на
+  // потребителя ("ако изтрия грешно анотирана работа в класрум, ще се
+  // отвори ли оригиналната работа"): ако последният файл е изтрит/преместен
+  // в кошчето В Drive (без да е detach-нат от Classroom - detach-ването
+  // само по себе си вече се вижда коректно, защото просто смалява
+  // driveAttachments), опитваме по-ранните прикачвания един по един, до
+  // оригинала - учителят никога не остава без работещ файл само защото
+  // едно НЕПРАВИЛНО копие е счупено.
+  for (let i = driveAttachments.length - 1; i >= 0; i--) {
+    const fileId = driveAttachments[i].driveFile.id;
+    const isOriginal = i === 0;
+    try {
+      const meta = await drive.files.get({ fileId, fields: 'name,mimeType,trashed' });
+      if (meta.data.trashed) throw new Error('файлът е в кошчето');
+      const content = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+      const base64Data = Buffer.from(content.data).toString('base64');
+      return { ok: true, fileName: meta.data.name, mimeType: meta.data.mimeType, base64Data, driveFileId: fileId, isOriginal: isOriginal };
+    } catch (e) {
+      console.error(tag, 'прескачам счупено копие (' + fileId + '):', describeApiError_(e));
+      if (i === 0) return { error: 'Грешка при изтегляне на файла: ' + describeApiError_(e) };
+      // иначе - продължава към предишното (по-старо) прикачване
+    }
   }
 }
 
