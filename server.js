@@ -94,15 +94,51 @@ async function resolveStudentId_(classroom, courseId, studentName) {
   return match.userId;
 }
 
+// Намира (по точно, нечувствително към регистър име) или създава Classroom
+// "Тема" (courses.topics) - 2026-11-07, по изрична идея на потребителя
+// ("работите могат да са разделени на теми - домашни/контролни/работа в
+// клас"): ползваме РОДНАТА Classroom функция "Теми" (същата, която учителят
+// вижда в приложението при ръчно създаване на задание), вместо да
+// изобретяваме отделна категоризация - остава синхронизирана с това, което
+// учителят вижда директно в Classroom. Скоупът classroom.coursework.students
+// (вече ползван от teacherCourseworkAuth) покрива courses.topics API-то -
+// не е нужен нов service-account scope.
+async function resolveTopicId_(classroom, courseId, topicName) {
+  const clean = (topicName || '').trim();
+  if (!clean) return null;
+  const list = await classroom.courses.topics.list({ courseId });
+  const existing = (list.data.topic || []).find((t) => t.name && t.name.toLowerCase() === clean.toLowerCase());
+  if (existing) return existing.topicId;
+  const created = await classroom.courses.topics.create({ courseId, requestBody: { name: clean } });
+  return created.data.topicId;
+}
+
 async function handleCreateAssignment(body) {
-  const { teacherEmail, courseId, title, description } = body;
+  const { teacherEmail, courseId, title, description, topicName } = body;
   if (!teacherEmail || !courseId || !title) return { error: 'Липсва teacherEmail/courseId/title.' };
   const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
+  let topicId = null;
+  try {
+    topicId = await resolveTopicId_(classroom, courseId, topicName);
+  } catch (e) {
+    return { error: 'Грешка при темата "' + topicName + '": ' + describeApiError_(e) };
+  }
   const result = await classroom.courses.courseWork.create({
     courseId,
-    requestBody: { title, description: description || undefined, workType: 'ASSIGNMENT', state: 'PUBLISHED' },
+    requestBody: { title, description: description || undefined, workType: 'ASSIGNMENT', state: 'PUBLISHED', topicId: topicId || undefined },
   });
-  return { ok: true, courseWorkId: result.data.id };
+  return { ok: true, courseWorkId: result.data.id, topicId: topicId, topicName: topicId ? (topicName || '').trim() : null };
+}
+
+// Връща темите, вече създадени в курса - за падащото меню "Тема" при ново
+// задание (free-form избор измежду вече съществуващите, виж резюмето по-горе).
+async function handleListTopics(body) {
+  const { teacherEmail, courseId } = body;
+  if (!teacherEmail || !courseId) return { error: 'Липсва teacherEmail/courseId.' };
+  const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
+  const list = await classroom.courses.topics.list({ courseId });
+  const topics = (list.data.topic || []).map((t) => ({ topicId: t.topicId, name: t.name }));
+  return { ok: true, topics: topics };
 }
 
 // Google API грешките носят полезни детайли в e.errors[] (reason/domain),
@@ -361,6 +397,7 @@ app.post('/', async (req, res) => {
   try {
     const body = req.body || {};
     if (body.action === 'createAssignment') { res.json(await handleCreateAssignment(body)); return; }
+    if (body.action === 'listTopics') { res.json(await handleListTopics(body)); return; }
     if (body.action === 'submitWork') { res.json(await handleSubmitWork(body)); return; }
     if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
     if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
