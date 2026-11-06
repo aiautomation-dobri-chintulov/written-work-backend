@@ -208,9 +208,10 @@ async function handleAttachGraded(body) {
   }
   if (!submission) return { error: 'Няма предаване за ' + studentEmail + ' в тази задача - ученикът не е предал работа.' };
 
+  let uploaded;
   try {
     const buffer = Buffer.from(base64Data, 'base64');
-    const uploaded = await drive.files.create({
+    uploaded = await drive.files.create({
       requestBody: { name: fileName },
       media: { mimeType: mimeType || 'application/octet-stream', body: Readable.from(buffer) },
       fields: 'id',
@@ -225,7 +226,7 @@ async function handleAttachGraded(body) {
   }
 
   console.log(tag, 'ПРИКАЧЕНО успешно.');
-  return { ok: true };
+  return { ok: true, driveFileId: uploaded.data.id };
 }
 
 // Изтегля оригинално предадения файл обратно от Classroom (за редактора за
