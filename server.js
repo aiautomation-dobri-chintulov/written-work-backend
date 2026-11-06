@@ -211,6 +211,51 @@ async function handleAttachGraded(body) {
   return { ok: true };
 }
 
+// Изтегля оригинално предадения файл обратно от Classroom (за редактора за
+// анотиране - учителят анотира ТОВА, не презаписва нищо) - 2026-11-07, по
+// изрично искане на потребителя (Път 3: "учителя директно да анотира
+// работата... оригиналната работа трябва да остане непипана"). Чете
+// ПЪРВИЯ Drive файл от прикачените в предаването (оригиналът, предаден от
+// ученика в Stage 1 - по-късно прикачени проверени копия идват след него).
+// Импersonating учителя (СЪЩИЯТ auth като attachGraded - само той има
+// право да чете прикаченото след turnIn).
+async function handleGetOriginal(body) {
+  const { teacherEmail, courseId, courseWorkId, studentEmail } = body;
+  const tag = '[getOriginal ' + studentEmail + ']';
+  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail) {
+    return { error: 'Липсват задължителни полета.' };
+  }
+
+  const auth = teacherDriveAuth(teacherEmail);
+  const classroom = google.classroom({ version: 'v1', auth });
+  const drive = google.drive({ version: 'v3', auth });
+
+  let submission;
+  try {
+    const res = await classroom.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId, userId: studentEmail });
+    submission = (res.data.studentSubmissions || [])[0] || null;
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при четене на submission:', describeApiError_(e));
+    return { error: 'Грешка при четене на submission: ' + describeApiError_(e) };
+  }
+  if (!submission) return { error: 'Няма предаване за ' + studentEmail + ' в тази задача.' };
+
+  const attachments = (submission.assignmentSubmission && submission.assignmentSubmission.attachments) || [];
+  const driveAttachments = attachments.filter((a) => a.driveFile);
+  if (driveAttachments.length === 0) return { error: 'Предаването няма прикачени файлове.' };
+  const fileId = driveAttachments[0].driveFile.id;
+
+  try {
+    const meta = await drive.files.get({ fileId, fields: 'name,mimeType' });
+    const content = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+    const base64Data = Buffer.from(content.data).toString('base64');
+    return { ok: true, fileName: meta.data.name, mimeType: meta.data.mimeType, base64Data };
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при изтегляне на файла:', describeApiError_(e));
+    return { error: 'Грешка при изтегляне на файла: ' + describeApiError_(e) };
+  }
+}
+
 const app = express();
 app.use(express.json({ limit: '15mb' })); // снимки/PDF-и като base64 могат да са няколко MB
 
@@ -226,6 +271,7 @@ app.post('/', async (req, res) => {
     if (body.action === 'createAssignment') { res.json(await handleCreateAssignment(body)); return; }
     if (body.action === 'submitWork') { res.json(await handleSubmitWork(body)); return; }
     if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
+    if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
     res.status(500).json({ error: e.message });
