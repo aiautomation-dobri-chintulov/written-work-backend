@@ -78,47 +78,75 @@ async function handleCreateAssignment(body) {
   return { ok: true, courseWorkId: result.data.id };
 }
 
+// Google API грешките носят полезни детайли в e.errors[] (reason/domain),
+// не само e.message - логваме и двете, за да личи ТОЧНО кой API call и
+// защо е гръмнал, вместо generic "permission" без контекст.
+function describeApiError_(e) {
+  const detail = (e && e.errors && e.errors[0]) || {};
+  return (e && e.message) + (detail.reason ? ' [reason=' + detail.reason + ', domain=' + detail.domain + ']' : '');
+}
+
 async function handleSubmitWork(body) {
   const { courseId, courseWorkId, studentEmail, fileName, mimeType, base64Data, teacherEmail } = body;
+  const tag = '[submitWork ' + studentEmail + ' / ' + fileName + ']';
   if (!courseId || !courseWorkId || !studentEmail || !fileName || !base64Data) {
     return { error: 'Липсват задължителни полета за ' + (fileName || studentEmail || '(непознат)') + '.' };
   }
 
-  const classroomTeacher = google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail || ADMIN_EMAIL) });
-  const enrollNote = await ensureEnrolled(classroomTeacher, courseId, studentEmail);
+  let enrollNote;
+  try {
+    const classroomTeacher = google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail || ADMIN_EMAIL) });
+    enrollNote = await ensureEnrolled(classroomTeacher, courseId, studentEmail);
+    console.log(tag, 'enroll:', enrollNote);
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при записване в курса:', describeApiError_(e));
+    return { error: 'Грешка при записване в курса: ' + describeApiError_(e) };
+  }
 
   const auth = studentAuth(studentEmail);
   const classroom = google.classroom({ version: 'v1', auth });
   const drive = google.drive({ version: 'v3', auth });
 
-  // Токущо записаният ученик понякога получава submission записа си със
-  // закъснение - изчакваме кратко и препроверяваме (СЪЩАТА логика като в
-  // inject-control-work.js).
-  let submission = await findOwnSubmission(classroom, courseId, courseWorkId);
-  if (!submission && enrollNote === 'записан сега') {
-    for (let i = 0; i < 3 && !submission; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      submission = await findOwnSubmission(classroom, courseId, courseWorkId);
+  let submission;
+  try {
+    // Токущо записаният ученик понякога получава submission записа си със
+    // закъснение - изчакваме кратко и препроверяваме (СЪЩАТА логика като в
+    // inject-control-work.js).
+    submission = await findOwnSubmission(classroom, courseId, courseWorkId);
+    if (!submission && enrollNote === 'записан сега') {
+      for (let i = 0; i < 3 && !submission; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        submission = await findOwnSubmission(classroom, courseId, courseWorkId);
+      }
     }
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при четене на submission:', describeApiError_(e));
+    return { error: 'Грешка при четене на submission: ' + describeApiError_(e) };
   }
   if (!submission) return { error: 'Няма submission запис за ' + studentEmail + ' (' + enrollNote + ').' };
   if (!['NEW', 'CREATED', 'RECLAIMED_BY_STUDENT'].includes(submission.state)) {
     return { error: 'submission вече е в статус "' + submission.state + '" - пропуснато.' };
   }
 
-  const buffer = Buffer.from(base64Data, 'base64');
-  const uploaded = await drive.files.create({
-    requestBody: { name: fileName },
-    media: { mimeType: mimeType || 'application/octet-stream', body: Readable.from(buffer) },
-    fields: 'id',
-  });
+  try {
+    const buffer = Buffer.from(base64Data, 'base64');
+    const uploaded = await drive.files.create({
+      requestBody: { name: fileName },
+      media: { mimeType: mimeType || 'application/octet-stream', body: Readable.from(buffer) },
+      fields: 'id',
+    });
 
-  await classroom.courses.courseWork.studentSubmissions.modifyAttachments({
-    courseId, courseWorkId, id: submission.id,
-    requestBody: { addAttachments: [{ driveFile: { id: uploaded.data.id } }] },
-  });
-  await classroom.courses.courseWork.studentSubmissions.turnIn({ courseId, courseWorkId, id: submission.id });
+    await classroom.courses.courseWork.studentSubmissions.modifyAttachments({
+      courseId, courseWorkId, id: submission.id,
+      requestBody: { addAttachments: [{ driveFile: { id: uploaded.data.id } }] },
+    });
+    await classroom.courses.courseWork.studentSubmissions.turnIn({ courseId, courseWorkId, id: submission.id });
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при качване/предаване:', describeApiError_(e));
+    return { error: 'Грешка при качване/предаване: ' + describeApiError_(e) };
+  }
 
+  console.log(tag, 'ПРЕДАДЕНО успешно.');
   return { ok: true, note: enrollNote };
 }
 
