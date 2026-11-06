@@ -261,17 +261,53 @@ async function handleGetOriginal(body) {
   const attachments = (submission.assignmentSubmission && submission.assignmentSubmission.attachments) || [];
   const driveAttachments = attachments.filter((a) => a.driveFile);
   if (driveAttachments.length === 0) return { error: 'Предаването няма прикачени файлове.' };
-  const fileId = driveAttachments[0].driveFile.id;
+  // ПОСЛЕДНИЯТ прикачен файл - 2026-11-07, по изрично искане на потребителя
+  // ("ще може ли анотирана работа повторно да се анотира"): оригиналът е
+  // attachments[0] (от Stage 1), всяко следващо "Запази анотираното копие"
+  // (attachGraded) ДОБАВЯ нов файл в края - затова последният елемент е
+  // ВИНАГИ най-актуалната версия (оригинал, ако още няма анотации; иначе
+  // последното анотирано копие) - учителят продължава откъдето е спрял,
+  // вместо винаги да вижда чист оригинал.
+  const isOriginal = driveAttachments.length === 1;
+  const fileId = driveAttachments[driveAttachments.length - 1].driveFile.id;
 
   try {
     const meta = await drive.files.get({ fileId, fields: 'name,mimeType' });
     const content = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
     const base64Data = Buffer.from(content.data).toString('base64');
-    return { ok: true, fileName: meta.data.name, mimeType: meta.data.mimeType, base64Data };
+    return { ok: true, fileName: meta.data.name, mimeType: meta.data.mimeType, base64Data, driveFileId: fileId, isOriginal: isOriginal };
   } catch (e) {
     console.error(tag, 'ГРЕШКА при изтегляне на файла:', describeApiError_(e));
     return { error: 'Грешка при изтегляне на файла: ' + describeApiError_(e) };
   }
+}
+
+// Презаписва СЪЩИЯ вече прикачен файл (анотирано копие от предишна сесия) -
+// за разлика от handleAttachGraded (който ДОБАВЯ нов файл), тук е просто
+// Drive files.update върху известен fileId - не пипа Classroom
+// attachments изобщо, защото файлът вече Е прикачен. Предотвратява
+// трупане на безкраен брой копия (анотирано-v1, v2, v3...) при всяка нова
+// сесия на анотиране - учителят вижда само оригинала + ЕДНО, непрекъснато
+// обновявано анотирано копие.
+async function handleUpdateAnnotated(body) {
+  const { teacherEmail, driveFileId, base64Data, mimeType } = body;
+  const tag = '[updateAnnotated ' + driveFileId + ']';
+  if (!teacherEmail || !driveFileId || !base64Data) {
+    return { error: 'Липсват задължителни полета.' };
+  }
+  const drive = google.drive({ version: 'v3', auth: teacherDriveAuth(teacherEmail) });
+  try {
+    const buffer = Buffer.from(base64Data, 'base64');
+    await drive.files.update({
+      fileId: driveFileId,
+      media: { mimeType: mimeType || 'image/png', body: Readable.from(buffer) },
+    });
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при презаписване:', describeApiError_(e));
+    return { error: 'Грешка при презаписване: ' + describeApiError_(e) };
+  }
+  console.log(tag, 'ПРЕЗАПИСАНО успешно.');
+  return { ok: true };
 }
 
 // Проверява кои от подадените courseWorkId все още СЪЩЕСТВУВАТ (не DELETED) -
@@ -316,6 +352,7 @@ app.post('/', async (req, res) => {
     if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
     if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
     if (body.action === 'checkCourseWorks') { res.json(await handleCheckCourseWorks(body)); return; }
+    if (body.action === 'updateAnnotated') { res.json(await handleUpdateAnnotated(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
     res.status(500).json({ error: e.message });
