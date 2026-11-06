@@ -87,7 +87,7 @@ function describeApiError_(e) {
 }
 
 async function handleSubmitWork(body) {
-  const { courseId, courseWorkId, studentEmail, fileName, mimeType, base64Data, teacherEmail } = body;
+  const { courseId, courseWorkId, studentEmail, fileName, mimeType, base64Data } = body;
   const tag = '[submitWork ' + studentEmail + ' / ' + fileName + ']';
   if (!courseId || !courseWorkId || !studentEmail || !fileName || !base64Data) {
     return { error: 'Липсват задължителни полета за ' + (fileName || studentEmail || '(непознат)') + '.' };
@@ -95,7 +95,12 @@ async function handleSubmitWork(body) {
 
   let enrollNote;
   try {
-    const classroomTeacher = google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail || ADMIN_EMAIL) });
+    // ВИНАГИ admin@ тук, НЕ учителският имейл - courses.students.create
+    // (директно добавяне без покана) изисква домейн-администраторски
+    // права, не просто "учител/собственик на курса" - потвърдено емпирично
+    // 2026-11-07 (виж inject-control-work.js:282, доказаният скрипт прави
+    // точно същото - teacherAuth(ADMIN_EMAIL), никога действителния учител).
+    const classroomTeacher = google.classroom({ version: 'v1', auth: rosterAuth(ADMIN_EMAIL) });
     enrollNote = await ensureEnrolled(classroomTeacher, courseId, studentEmail);
     console.log(tag, 'enroll:', enrollNote);
   } catch (e) {
