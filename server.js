@@ -78,16 +78,20 @@ async function findOwnSubmission(classroom, courseId, courseWorkId) {
   return (res.data.studentSubmissions || [])[0] || null;
 }
 
-// studentSubmissions.list с userId=имейл връща "failedPrecondition" когато
-// викащият е service account (не истинска потребителска сесия) - Classroom
-// API документацията твърди, че приема имейл, но емпирично (2026-11-07,
-// открито при реален тест на редактора за анотиране) това не важи за
-// service account impersonation. Доказаният upload-checked-control-work.js
-// винаги подава ЧИСЛОВИЯ Google ID - затова разрешаваме имейла към число
-// ПРЕДИ всяко studentSubmissions.list извикване като учител.
-async function resolveStudentId_(classroom, courseId, studentEmail) {
-  const res = await classroom.courses.students.get({ courseId, userId: studentEmail });
-  return res.data.userId;
+// Всяко Classroom API извикване с userId=ИМЕЙЛ (studentSubmissions.list,
+// ДОРИ courses.students.get) връща "failedPrecondition", когато викащият е
+// service account (не истинска потребителска сесия) - документацията
+// твърди, че приема имейл, но емпирично (2026-11-07, открито при реален
+// тест на редактора за анотиране) това не важи за service account
+// impersonation. Единственият НАДЕЖДЕН начин (потвърден директно през API) -
+// courses.students.list БЕЗ fields mask (с fields mask имейлът изчезва от
+// отговора по непонятна причина) + съвпадение по ПЪЛНО ИМЕ (вече уникално
+// проверено при самото съпоставяне на файловете - виж matchStudent_).
+async function resolveStudentId_(classroom, courseId, studentName) {
+  const res = await classroom.courses.students.list({ courseId });
+  const match = (res.data.students || []).find((s) => s.profile && s.profile.name && s.profile.name.fullName === studentName);
+  if (!match) throw new Error('Ученикът "' + studentName + '" не е намерен в курса.');
+  return match.userId;
 }
 
 async function handleCreateAssignment(body) {
@@ -183,9 +187,9 @@ async function handleSubmitWork(body) {
 // ЧИСЛОВИЯ ID на ученика (виж resolveStudentId_ - имейл директно в
 // studentSubmissions.list дава "failedPrecondition" за service account).
 async function handleAttachGraded(body) {
-  const { teacherEmail, courseId, courseWorkId, studentEmail, fileName, mimeType, base64Data } = body;
+  const { teacherEmail, courseId, courseWorkId, studentEmail, studentName, fileName, mimeType, base64Data } = body;
   const tag = '[attachGraded ' + studentEmail + ' / ' + fileName + ']';
-  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail || !fileName || !base64Data) {
+  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail || !studentName || !fileName || !base64Data) {
     return { error: 'Липсват задължителни полета за ' + (fileName || studentEmail || '(непознат)') + '.' };
   }
 
@@ -195,7 +199,7 @@ async function handleAttachGraded(body) {
 
   let submission;
   try {
-    const studentId = await resolveStudentId_(google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) }), courseId, studentEmail);
+    const studentId = await resolveStudentId_(google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) }), courseId, studentName);
     const res = await classroom.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId, userId: studentId });
     submission = (res.data.studentSubmissions || [])[0] || null;
   } catch (e) {
@@ -233,9 +237,9 @@ async function handleAttachGraded(body) {
 // Импersonating учителя (СЪЩИЯТ auth като attachGraded - само той има
 // право да чете прикаченото след turnIn).
 async function handleGetOriginal(body) {
-  const { teacherEmail, courseId, courseWorkId, studentEmail } = body;
+  const { teacherEmail, courseId, courseWorkId, studentEmail, studentName } = body;
   const tag = '[getOriginal ' + studentEmail + ']';
-  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail) {
+  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail || !studentName) {
     return { error: 'Липсват задължителни полета.' };
   }
 
@@ -245,7 +249,7 @@ async function handleGetOriginal(body) {
 
   let submission;
   try {
-    const studentId = await resolveStudentId_(google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) }), courseId, studentEmail);
+    const studentId = await resolveStudentId_(google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) }), courseId, studentName);
     const res = await classroom.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId, userId: studentId });
     submission = (res.data.studentSubmissions || [])[0] || null;
   } catch (e) {
