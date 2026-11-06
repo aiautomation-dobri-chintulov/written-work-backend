@@ -49,6 +49,17 @@ function studentAuth(email) {
   });
 }
 
+// За прикачане на ПРОВЕРЕНИ/оценени копия към ВЕЧЕ предадена работа - СЛЕД
+// turnIn() Classroom отнема писателски Drive права на ученика и прави
+// учителя собственик, затова тук учителят (не ученикът) качва и прикача -
+// пренесено буквално от upload-checked-control-work.js (доказан скрипт).
+function teacherDriveAuth(email) {
+  return new google.auth.JWT({
+    email: key.client_email, key: key.private_key, subject: email,
+    scopes: ['https://www.googleapis.com/auth/classroom.coursework.students', 'https://www.googleapis.com/auth/drive'],
+  });
+}
+
 // Записва ученика директно в курса (байпас на поканата) - СЪЩАТА логика
 // като ensureEnrolled() в inject-control-work.js, пренесена буквално.
 async function ensureEnrolled(classroomTeacher, courseId, studentEmail) {
@@ -155,6 +166,51 @@ async function handleSubmitWork(body) {
   return { ok: true, note: enrollNote };
 }
 
+// Прикачва проверено/оценено копие към ВЕЧЕ turned-in предаване - НЕ пипа
+// оригинала/черновите, ученикът вижда и двете. Намира submission по
+// studentEmail (userId параметърът на studentSubmissions.list приема имейл
+// директно, не само числов ID - потвърдено в Classroom API документацията).
+async function handleAttachGraded(body) {
+  const { teacherEmail, courseId, courseWorkId, studentEmail, fileName, mimeType, base64Data } = body;
+  const tag = '[attachGraded ' + studentEmail + ' / ' + fileName + ']';
+  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail || !fileName || !base64Data) {
+    return { error: 'Липсват задължителни полета за ' + (fileName || studentEmail || '(непознат)') + '.' };
+  }
+
+  const auth = teacherDriveAuth(teacherEmail);
+  const classroom = google.classroom({ version: 'v1', auth });
+  const drive = google.drive({ version: 'v3', auth });
+
+  let submission;
+  try {
+    const res = await classroom.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId, userId: studentEmail });
+    submission = (res.data.studentSubmissions || [])[0] || null;
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при четене на submission:', describeApiError_(e));
+    return { error: 'Грешка при четене на submission: ' + describeApiError_(e) };
+  }
+  if (!submission) return { error: 'Няма предаване за ' + studentEmail + ' в тази задача - ученикът не е предал работа.' };
+
+  try {
+    const buffer = Buffer.from(base64Data, 'base64');
+    const uploaded = await drive.files.create({
+      requestBody: { name: fileName },
+      media: { mimeType: mimeType || 'application/octet-stream', body: Readable.from(buffer) },
+      fields: 'id',
+    });
+    await classroom.courses.courseWork.studentSubmissions.modifyAttachments({
+      courseId, courseWorkId, id: submission.id,
+      requestBody: { addAttachments: [{ driveFile: { id: uploaded.data.id } }] },
+    });
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при прикачане:', describeApiError_(e));
+    return { error: 'Грешка при прикачане: ' + describeApiError_(e) };
+  }
+
+  console.log(tag, 'ПРИКАЧЕНО успешно.');
+  return { ok: true };
+}
+
 const app = express();
 app.use(express.json({ limit: '15mb' })); // снимки/PDF-и като base64 могат да са няколко MB
 
@@ -169,6 +225,7 @@ app.post('/', async (req, res) => {
     const body = req.body || {};
     if (body.action === 'createAssignment') { res.json(await handleCreateAssignment(body)); return; }
     if (body.action === 'submitWork') { res.json(await handleSubmitWork(body)); return; }
+    if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
     res.status(500).json({ error: e.message });
