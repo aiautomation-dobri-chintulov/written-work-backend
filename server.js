@@ -23,7 +23,7 @@ const { google } = require('googleapis');
 const { Readable } = require('stream');
 const path = require('path');
 const PDFDocument = require('pdfkit');
-const { Jimp } = require('jimp');
+const sharp = require('sharp');
 
 const DOMAIN = 'dobri-chintulov-varna.bg';
 const ADMIN_EMAIL = 'admin@' + DOMAIN;
@@ -449,24 +449,43 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-2.0-flash';
 const NAME_BAND_FRACTION = 0.14; // горна част от снимката, зачернява се - там обичайно се пише ръкописно име/клас
 
+// Маскира снимка, която Е ВЕЧЕ малка (Drive thumbnail, виж fetchSubmissionImage_
+// по-долу защо не декодираме оригинала) - sharp decode+composite+encode на
+// снимка от този размер е безопасно евтино (потвърдено на ръка: <1MB heap
+// delta на тестова 1200x900 снимка), за разлика от decode на пълна
+// телефонна резолюция (12+ MPx), което на реален тест с цял клас (20+
+// ученика) катастрофира Render инстанцията по памет.
 async function maskNameBand_(buffer) {
-  const image = await Jimp.read(buffer);
-  // РЕСАЙЗ ПРЕДИ зачерняване - 2026-11-07, по реален тест на цял клас
-  // (20+ ученика, снимки от телефон - по няколко MPx всяка): зачернянето
-  // сканира пиксел по пиксел (scan()), а pdfkit/Jimp JPEG енкодера е чист
-  // JS (бавен) - на пълна резолюция цялата операция за цял клас отне над 3
-  // минути, недопустимо за синхронна заявка. Смаляването ПЪРВО намалява
-  // пикселите за сканиране/енкодване с множител ~4-9x, ръкописният текст
-  // остава напълно четим за Gemini на 1200px ширина.
-  if (image.bitmap.width > 1200) image.resize({ w: 1200 });
-  const bandHeight = Math.round(image.bitmap.height * NAME_BAND_FRACTION);
-  image.scan(0, 0, image.bitmap.width, bandHeight, function (x, y, idx) {
-    this.bitmap.data[idx + 0] = 0;
-    this.bitmap.data[idx + 1] = 0;
-    this.bitmap.data[idx + 2] = 0;
-    this.bitmap.data[idx + 3] = 255;
-  });
-  return image.getBuffer('image/jpeg');
+  const meta = await sharp(buffer).metadata();
+  const bandHeight = Math.round((meta.height || 900) * NAME_BAND_FRACTION);
+  const band = await sharp({
+    create: { width: meta.width, height: bandHeight, channels: 3, background: { r: 0, g: 0, b: 0 } },
+  }).png().toBuffer();
+  return sharp(buffer).composite([{ input: band, top: 0, left: 0 }]).jpeg({ quality: 85 }).toBuffer();
+}
+
+// Изтегля ЧЕТИМА за Gemini версия на предадена снимка - 2026-11-07, по
+// реален тест на цял клас: (1) студентски снимки от телефон идват ЧЕСТО
+// като HEIC (iPhone по подразбиране) - НИТО Jimp, НИТО стандартният sharp
+// prebuilt binary (липсва HEVC декодер libde265, патентни причини) могат да
+// декодират HEIC съдържание, само метаданните; (2) декодиране на ПЪЛНАТА
+// телефонна резолюция (12+ MPx = 40-50MB суров bitmap В ПАМЕТТА за ЕДНА
+// снимка) за 20+ ученика с 4-паралелна обработка катастрофира Render
+// инстанцията с OOM, потвърдено на живо (502, инстанцията рестартира).
+// РЕШЕНИЕ - Google Drive вече генерира JPEG thumbnail за ВСЯКА снимка,
+// независимо от оригиналния формат (thumbnailLink, нормално =s220, но
+// суфиксът приема произволен размер) - заменя `=s220` с по-голям размер,
+// изтегля ГОТОВИЯ JPEG директно (HEIC проблемът изчезва - Drive е свършил
+// конверсията вместо нас), малък по дизайн (без риск от OOM). Четливост
+// потвърдена на ръка с реална ученическа снимка на 1200px - напълно четим
+// ръкописен текст, дори дребен.
+async function fetchSubmissionImage_(drive, accessToken, fileId) {
+  const meta = await drive.files.get({ fileId, fields: 'trashed,thumbnailLink' });
+  if (meta.data.trashed || !meta.data.thumbnailLink) return null;
+  const url = meta.data.thumbnailLink.replace(/=s\d+$/, '=s1200');
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } });
+  if (!res.ok) throw new Error('thumbnail HTTP ' + res.status);
+  return Buffer.from(await res.arrayBuffer());
 }
 
 // Прост concurrency pool - 2026-11-07, по реален тест на цял клас: последователна
@@ -617,7 +636,9 @@ async function handleStartAnalyzeHomework(body) {
 
   const classroomWork = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
   const classroomRoster = google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) });
-  const drive = google.drive({ version: 'v3', auth: teacherDriveAuth(teacherEmail) });
+  const driveAuthClient = teacherDriveAuth(teacherEmail);
+  const drive = google.drive({ version: 'v3', auth: driveAuthClient });
+  const { token: driveAccessToken } = await driveAuthClient.getAccessToken(); // за директния fetch() на thumbnailLink по-долу - googleapis клиентът не го ползва за суров HTTP
 
   let courseWork;
   try {
@@ -675,10 +696,9 @@ async function handleStartAnalyzeHomework(body) {
           const images = [];
           for (const att of attachments) {
             try {
-              const meta = await drive.files.get({ fileId: att.driveFile.id, fields: 'name,mimeType,trashed' });
-              if (meta.data.trashed || !/^image\//.test(meta.data.mimeType || '')) continue;
-              const content = await drive.files.get({ fileId: att.driveFile.id, alt: 'media' }, { responseType: 'arraybuffer' });
-              const masked = await maskNameBand_(Buffer.from(content.data));
+              const thumbBuffer = await fetchSubmissionImage_(drive, driveAccessToken, att.driveFile.id);
+              if (!thumbBuffer) continue; // изтрит файл или Drive няма preview за него (напр. не-изображение)
+              const masked = await maskNameBand_(thumbBuffer);
               images.push({ mimeType: 'image/jpeg', base64: masked.toString('base64') });
             } catch (e) {
               console.error('[analyzeHomework] неуспешно изтегляне на прикачен файл ' + att.driveFile.id + ':', describeApiError_(e));
