@@ -21,6 +21,9 @@
 const express = require('express');
 const { google } = require('googleapis');
 const { Readable } = require('stream');
+const path = require('path');
+const PDFDocument = require('pdfkit');
+const { Jimp } = require('jimp');
 
 const DOMAIN = 'dobri-chintulov-varna.bg';
 const ADMIN_EMAIL = 'admin@' + DOMAIN;
@@ -426,6 +429,309 @@ async function handleListCourseWork(body) {
   return { ok: true, items: items };
 }
 
+// --- Анализ на домашни работи с AI (Gemini) - "Анализ възложени задачи",
+// 2026-11-07. Classroom НЕ носи готов ключ с верни отговори за задачите
+// (title/description тук обикновено е само "Снимате и прилагате към
+// задачата" - условието идва от учебник/тест извън Classroom) - затова AI
+// преценява коректността директно от снимката (условие + решение на
+// ученика са на самия лист), а title/description/тема служат само като
+// КОНТЕКСТ (предмет/клас/тема), не като сверовъчен ключ.
+//
+// ПСЕВДОНИМИЗАЦИЯ ПРЕДИ ИЗПРАЩАНЕ КЪМ GEMINI - по изрично решение на
+// потребителя, след обсъждане на [[feedback_pseudonymize_external]]: Gemini
+// API е ОТДЕЛЕН от Google Workspace for Education data protections (платен
+// API ключ, друг договор), затова снимките (ръкописни домашни, може да имат
+// име на ученика написано горе на листа) се зачерняват в горната си част
+// ПРЕДИ изпращане. Реалната самоличност на ученика идва ОТДЕЛНО, от
+// Classroom roster (courses.students.list) по userId от самото предаване -
+// Gemini никога не научава кой е ученикът, само вижда зачернена снимка.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = 'gemini-2.0-flash';
+const NAME_BAND_FRACTION = 0.14; // горна част от снимката, зачернява се - там обичайно се пише ръкописно име/клас
+
+async function maskNameBand_(buffer) {
+  const image = await Jimp.read(buffer);
+  // РЕСАЙЗ ПРЕДИ зачерняване - 2026-11-07, по реален тест на цял клас
+  // (20+ ученика, снимки от телефон - по няколко MPx всяка): зачернянето
+  // сканира пиксел по пиксел (scan()), а pdfkit/Jimp JPEG енкодера е чист
+  // JS (бавен) - на пълна резолюция цялата операция за цял клас отне над 3
+  // минути, недопустимо за синхронна заявка. Смаляването ПЪРВО намалява
+  // пикселите за сканиране/енкодване с множител ~4-9x, ръкописният текст
+  // остава напълно четим за Gemini на 1200px ширина.
+  if (image.bitmap.width > 1200) image.resize({ w: 1200 });
+  const bandHeight = Math.round(image.bitmap.height * NAME_BAND_FRACTION);
+  image.scan(0, 0, image.bitmap.width, bandHeight, function (x, y, idx) {
+    this.bitmap.data[idx + 0] = 0;
+    this.bitmap.data[idx + 1] = 0;
+    this.bitmap.data[idx + 2] = 0;
+    this.bitmap.data[idx + 3] = 255;
+  });
+  return image.getBuffer('image/jpeg');
+}
+
+// Прост concurrency pool - 2026-11-07, по реален тест на цял клас: последователна
+// (един по един) обработка на ученици е прекалено бавна за синхронна HTTP
+// заявка (виж бележката при startAnalyzeHomeworkJob_ за пълната история защо
+// изобщо има job/poll модел). Ограничен паралелизъм (не "всички наведнъж") -
+// пести и Gemini rate limits, и паметта на Render free tier.
+async function withConcurrency_(items, limit, worker) {
+  let idx = 0;
+  const results = new Array(items.length);
+  async function runner() {
+    while (idx < items.length) {
+      const current = idx++;
+      results[current] = await worker(items[current], current);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return results;
+}
+
+async function callGemini_(parts, generationConfig) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY не е зададен на Render (Environment variables).');
+  const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts }], generationConfig: generationConfig || {} }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error((data.error && data.error.message) || ('Gemini грешка ' + res.status));
+  const text = data.candidates && data.candidates[0] && data.candidates[0].content.parts[0].text;
+  if (!text) throw new Error('Gemini не върна съдържание.');
+  return text;
+}
+
+const STUDENT_ANALYSIS_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    errors: { type: 'ARRAY', items: { type: 'STRING' } },
+    summary: { type: 'STRING' },
+  },
+  required: ['errors', 'summary'],
+};
+
+async function analyzeStudentSubmission_(ctx, images) {
+  const promptText = 'Ти си учител по "' + ctx.subject + '" в ' + ctx.className + ' клас. ' +
+    'Ученик е предал снимки на домашна работа по следната задача:\n' +
+    'Заглавие: ' + ctx.title + '\n' +
+    (ctx.topicName ? ('Тема: ' + ctx.topicName + '\n') : '') +
+    (ctx.description ? ('Указания: ' + ctx.description + '\n') : '') +
+    '\nПрегледай снимките (условието на задачата и решението на ученика са на самите снимки) и провери дали решението е вярно. ' +
+    'В полето "errors" изброй КОНКРЕТНИ грешки - кратко, по една точка на елемент (ако няма грешки, върни празен списък []). ' +
+    'В "summary" напиши 1-2 изречения обща оценка на представянето. Пиши на български.\n' +
+    'ВАЖНО: горната част на всяка снимка е умишлено зачернена (скрито е името на ученика) - това НЕ Е част от решението, игнорирай я напълно.';
+  const parts = [{ text: promptText }];
+  images.forEach((img) => { parts.push({ inlineData: { mimeType: img.mimeType, data: img.base64 } }); });
+  const text = await callGemini_(parts, { responseMimeType: 'application/json', responseSchema: STUDENT_ANALYSIS_SCHEMA });
+  return JSON.parse(text);
+}
+
+// Обобщението за класа е ВТОРО, отделно извикване - само текст (никакви
+// снимки, никакви имена - само "Ученик 1/2/3" по РЕДА на обхождане),
+// допълнителна предпазна мярка towards [[feedback_pseudonymize_external]].
+async function summarizeClassWithGemini_(ctx, results) {
+  const analyzed = results.filter((r) => r.submitted && !r.failed);
+  if (analyzed.length === 0) return 'Няма достатъчно успешно анализирани предавания за обобщение.';
+  const lines = analyzed.map((r, i) => 'Ученик ' + (i + 1) + ': ' + (r.summary || '') + (r.errors.length ? (' Грешки: ' + r.errors.join('; ')) : ' Без грешки.'));
+  const promptText = 'По-долу са индивидуални AI оценки на домашна работа по "' + ctx.subject + '", ' + ctx.className + ' клас, ' +
+    'задача "' + ctx.title + '"' + (ctx.topicName ? (' (тема: ' + ctx.topicName + ')') : '') + ':\n\n' + lines.join('\n') +
+    '\n\nНаправи КРАТКО обобщение за класа (до 120 думи, на български): кои грешки/затруднения се повтарят най-често, ' +
+    'обща оценка на представянето, и какво си заслужава да се повтори в час. Не споменавай номерата на учениците поотделно.';
+  return callGemini_([{ text: promptText }], {});
+}
+
+// DejaVu Sans (пълен TTF файл, НЕ web-subset - виж server.js README/коментар
+// при изтеглянето) - вградените в pdfkit стандартни шрифтове (Helvetica и
+// т.н.) НЯМАТ кирилски глифи изобщо, потвърдено на ръка преди да се гради
+// тази функция (празен/грешен текст без собствен TTF).
+const CYRILLIC_FONT_PATH = path.join(__dirname, 'fonts', 'DejaVuSans.ttf');
+
+function buildHomeworkReportPdf_({ subject, className, title, topicName, results, classSummary }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50 });
+    const chunks = [];
+    doc.on('data', (c) => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.font(CYRILLIC_FONT_PATH);
+    doc.fontSize(18).fillColor('#000').text('Анализ възложени задачи');
+    doc.moveDown(0.3);
+    doc.fontSize(11).fillColor('#555')
+      .text('Предмет: ' + subject + '   Клас: ' + className)
+      .text('Задание: ' + title + (topicName ? ('   Тема: ' + topicName) : ''))
+      .text('Генерирано на: ' + new Date().toLocaleDateString('bg'));
+    doc.fillColor('#000');
+    doc.moveDown(1);
+
+    doc.fontSize(14).text('Обобщение за класа');
+    doc.moveDown(0.2);
+    doc.fontSize(11).text(classSummary || '(няма)');
+    doc.moveDown(1);
+
+    const submittedCount = results.filter((r) => r.submitted).length;
+    doc.fontSize(14).text('По ученици (' + submittedCount + ' от ' + results.length + ' предадени)');
+
+    results.slice().sort((a, b) => a.name.localeCompare(b.name, 'bg')).forEach((r) => {
+      doc.moveDown(0.6);
+      doc.fontSize(12).fillColor('#000').text(r.name + (r.late ? ' (закъсняло)' : ''));
+      if (!r.submitted) {
+        doc.fontSize(10.5).fillColor('#b71c1c').text('Не е предадено.');
+      } else if (r.failed) {
+        doc.fontSize(10.5).fillColor('#b71c1c').text('Грешка при анализа: ' + r.failReason);
+      } else if (r.errors.length === 0) {
+        doc.fontSize(10.5).fillColor('#2e7d32').text('Без забелязани грешки. ' + (r.summary || ''));
+      } else {
+        doc.fontSize(10.5).fillColor('#444').text(r.summary || '');
+        r.errors.forEach((e) => doc.fontSize(10.5).fillColor('#b71c1c').text('• ' + e));
+      }
+      doc.fillColor('#000');
+    });
+
+    doc.end();
+  });
+}
+
+// Job/poll модел ВМЕСТО една синхронна заявка - 2026-11-07, по реален тест
+// на цял клас (Математика ИУЧ/6б, 20+ ученика): свалянето+маскирането на
+// снимките само по себе си отне над 3 минути на пълна резолюция (оправено
+// отделно чрез по-ранен ресайз, виж maskNameBand_), а с реални Gemini
+// извиквания отгоре (вместо незабавния 403 без billing) общото време за цял
+// клас реалистично минава границите на единична синхронна HTTP заявка
+// (Apps Script UrlFetchApp/Render proxy timeout). Решение: 'startHomeworkAnalysis'
+// връща jobId ВЕДНАГА (след бързата метаданни проверка), реалната обработка
+// тече във фонов async без да се чака, 'getHomeworkAnalysisStatus' се пита
+// на интервали от dashboard-а. In-memory Map е достатъчен - еднопотребителски
+// вътрешен инструмент, Render процесът остава буден докато обработва.
+const analysisJobs = new Map();
+const ANALYSIS_CONCURRENCY = 4;
+
+function makeJobId_() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+async function handleStartAnalyzeHomework(body) {
+  const { teacherEmail, subject, className, courseId, courseWorkId } = body;
+  if (!teacherEmail || !courseId || !courseWorkId) return { error: 'Липсват задължителни данни.' };
+  if (!GEMINI_API_KEY) return { error: 'GEMINI_API_KEY не е зададен на Render backend-а (Environment variables) - анализът не може да работи без него.' };
+
+  const classroomWork = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
+  const classroomRoster = google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) });
+  const drive = google.drive({ version: 'v3', auth: teacherDriveAuth(teacherEmail) });
+
+  let courseWork;
+  try {
+    const res = await classroomWork.courses.courseWork.get({ courseId, id: courseWorkId });
+    courseWork = res.data;
+  } catch (e) {
+    return { error: 'Грешка при четене на заданието: ' + describeApiError_(e) };
+  }
+
+  let topicName = '';
+  if (courseWork.topicId) {
+    try {
+      const topicsRes = await classroomWork.courses.topics.list({ courseId });
+      const t = (topicsRes.data.topic || []).find((x) => x.topicId === courseWork.topicId);
+      topicName = (t && t.name) || '';
+    } catch (e) {
+      console.error('[analyzeHomework] неуспешно четене на теми (продължавам без тема):', describeApiError_(e));
+    }
+  }
+
+  let roster;
+  try {
+    const res = await classroomRoster.courses.students.list({ courseId });
+    roster = res.data.students || [];
+  } catch (e) {
+    return { error: 'Грешка при четене на списъка с ученици: ' + describeApiError_(e) };
+  }
+  const nameById = {};
+  roster.forEach((s) => { nameById[s.userId] = (s.profile && s.profile.name && s.profile.name.fullName) || s.userId; });
+
+  let submissions;
+  try {
+    const res = await classroomWork.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId });
+    submissions = res.data.studentSubmissions || [];
+  } catch (e) {
+    return { error: 'Грешка при четене на предаванията: ' + describeApiError_(e) };
+  }
+
+  const ctx = { subject: subject || '', className: className || '', title: courseWork.title || '', topicName, description: courseWork.description || '' };
+  const jobId = makeJobId_();
+  analysisJobs.set(jobId, { status: 'running', done: 0, total: submissions.length, createdAt: Date.now() });
+
+  // НЕ се изчаква (umишлено липсва await) - заявката връща jobId веднага,
+  // реалната работа продължава във фонов режим, прогресът се пише в analysisJobs.
+  (async () => {
+    try {
+      const results = await withConcurrency_(submissions, ANALYSIS_CONCURRENCY, async (sub) => {
+        const name = nameById[sub.userId] || sub.userId;
+        const submitted = sub.state === 'TURNED_IN' || sub.state === 'RETURNED';
+        let result;
+        if (!submitted) {
+          result = { name, submitted: false, late: !!sub.late, errors: [] };
+        } else {
+          const attachments = ((sub.assignmentSubmission || {}).attachments || []).filter((a) => a.driveFile);
+          const images = [];
+          for (const att of attachments) {
+            try {
+              const meta = await drive.files.get({ fileId: att.driveFile.id, fields: 'name,mimeType,trashed' });
+              if (meta.data.trashed || !/^image\//.test(meta.data.mimeType || '')) continue;
+              const content = await drive.files.get({ fileId: att.driveFile.id, alt: 'media' }, { responseType: 'arraybuffer' });
+              const masked = await maskNameBand_(Buffer.from(content.data));
+              images.push({ mimeType: 'image/jpeg', base64: masked.toString('base64') });
+            } catch (e) {
+              console.error('[analyzeHomework] неуспешно изтегляне на прикачен файл ' + att.driveFile.id + ':', describeApiError_(e));
+            }
+          }
+          if (images.length === 0) {
+            result = { name, submitted: true, late: !!sub.late, failed: true, failReason: 'няма четими снимки в прикачените файлове', errors: [] };
+          } else {
+            try {
+              const analysis = await analyzeStudentSubmission_(ctx, images);
+              result = { name, submitted: true, late: !!sub.late, errors: analysis.errors || [], summary: analysis.summary || '' };
+            } catch (e) {
+              console.error('[analyzeHomework] Gemini грешка за ' + name + ':', e.message);
+              result = { name, submitted: true, late: !!sub.late, failed: true, failReason: e.message, errors: [] };
+            }
+          }
+        }
+        const job = analysisJobs.get(jobId);
+        if (job) job.done += 1;
+        return result;
+      });
+
+      let classSummary = '';
+      try {
+        classSummary = await summarizeClassWithGemini_(ctx, results);
+      } catch (e) {
+        console.error('[analyzeHomework] неуспешно обобщение за класа:', e.message);
+        classSummary = '(неуспешно генериране на обобщение: ' + e.message + ')';
+      }
+
+      const pdfBuffer = await buildHomeworkReportPdf_({ subject: subject || '', className: className || '', title: courseWork.title || '', topicName, results, classSummary });
+      analysisJobs.set(jobId, {
+        status: 'done', done: submissions.length, total: submissions.length,
+        fileName: 'Анализ - ' + (courseWork.title || courseWorkId) + '.pdf',
+        pdfBase64: pdfBuffer.toString('base64'),
+      });
+    } catch (e) {
+      console.error('[analyzeHomework] job ' + jobId + ' гръмна:', e.message);
+      analysisJobs.set(jobId, { status: 'error', error: e.message });
+    }
+    // почистване след 30 минути - jobId вече ще е изтеглен от dashboard-а
+    setTimeout(() => analysisJobs.delete(jobId), 30 * 60 * 1000).unref();
+  })();
+
+  return { ok: true, jobId, total: submissions.length };
+}
+
+function handleGetAnalyzeHomeworkStatus(body) {
+  const job = analysisJobs.get(body.jobId);
+  if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
+  return { ok: true, status: job.status, done: job.done || 0, total: job.total || 0, fileName: job.fileName, pdfBase64: job.pdfBase64, error: job.error };
+}
+
 const app = express();
 app.use(express.json({ limit: '15mb' })); // снимки/PDF-и като base64 могат да са няколко MB
 
@@ -445,6 +751,8 @@ app.post('/', async (req, res) => {
     if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
     if (body.action === 'listCourseWork') { res.json(await handleListCourseWork(body)); return; }
     if (body.action === 'updateAnnotated') { res.json(await handleUpdateAnnotated(body)); return; }
+    if (body.action === 'startHomeworkAnalysis') { res.json(await handleStartAnalyzeHomework(body)); return; }
+    if (body.action === 'getHomeworkAnalysisStatus') { res.json(handleGetAnalyzeHomeworkStatus(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
     res.status(500).json({ error: e.message });

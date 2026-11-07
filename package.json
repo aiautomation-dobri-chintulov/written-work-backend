@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "googleapis": "^126.0.0"
+    "googleapis": "^126.0.0",
+    "jimp": "^1.6.0",
+    "pdfkit": "^0.15.0"
   }
 }
