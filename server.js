@@ -794,14 +794,6 @@ const GRADE_TASK_SCHEMA = {
       },
     },
     gradeScaleText: { type: 'STRING' },
-    // "Получени точки" РЕД на обобщителната таблица (Задача 1 2 3... Общо) -
-    // ЕДНА кутия за целия ред, не по кутия на клетка (твърде рисковано да
-    // познае 9 отделни клетки точно) - ние после делим на равни колони по
-    // брой задачи, виж drawSummaryTable_. null, ако страницата няма такава
-    // таблица (типично - ако отговорите са на друга страница от решението).
-    summaryPointsRowBox: { type: 'ARRAY', items: { type: 'NUMBER' } },
-    // Празния ред "Оценка: ______" (само реда, не цялата таблица).
-    summaryGradeBox: { type: 'ARRAY', items: { type: 'NUMBER' } },
   },
   required: ['tasks'],
 };
@@ -823,8 +815,6 @@ async function gradeImageWithGemini_(ctx, imageBase64) {
     '4. Ако НЕ е присъдена пълната оценка, кратка бележка (до 10 думи) защо.\n' +
     '5. "box" - нормализирани координати [y_min, x_min, y_max, x_max] в скала 0-1000 спрямо ЦЯЛОТО изображение, сочещи мястото на РЪКОПИСНИЯ ОТГОВОР на ученика за тази задача (не отпечатаното условие).\n\n' +
     'Ако в долната част на страницата има таблица, превръщаща общ брой точки в оценка (напр. "0-8 Слаб2, 9-14 Среден3..."), препиши я като свободен текст в "gradeScaleText".\n' +
-    'Ако на страницата има обобщителна таблица с редове "Задача / Максимум точки / Получени точки" (празен ред "Получени точки" за попълване) - посочи "summaryPointsRowBox": нормализирани координати [y_min, x_min, y_max, x_max] на ЦЕЛИЯ празен ред "Получени точки" (от първата до последната клетка на реда, включително клетката "Общо"), НЕ на отделна клетка.\n' +
-    'Ако има отделен празен ред/поле "Оценка: ______" за попълване - посочи "summaryGradeBox": нормализирани координати само на празното място след "Оценка:".\n' +
     'Ако задача няма решение изобщо (празно поле), присъди 0 точки и отбележи "няма решение".\n' +
     'Пиши бележките на български.';
   const text = await callGemini_(
@@ -841,6 +831,18 @@ async function gradeImageWithGemini_(ctx, imageBase64) {
 // реално отива в Classroom - за разлика от writtenWork-анализа, тук НЯМА
 // нужда от псевдонимизация на изхода, само на входа към Gemini, виж
 // handleStartGradeWork).
+// 2026-11-07 преработка (по изрично искане след реален пример "далеч от
+// красива проверка" + счупена таблица "20301008"): по-рано тук се чертаеше
+// кръгче+символ+"X/Y" като печатен digital бадж, а обобщителната таблица
+// се опитваше да пише ТОЧНО в откритата от Gemini тясна печатна клетка
+// (drawSummaryTable_, премахната) - на практика редът се оказа твърде тесен
+// за 9 стойности и цифрите се сляха в безсмислена каша. Новият подход имитира
+// истинско учителско "проверка с червена химикалка": само числото точки,
+// червено мастило, леко завъртяно (хаотичност на ръка), с бяла "ореола" зад
+// буквите (paint-order: stroke) вместо бяла кутия - четливо върху всякакъв
+// фон без да изглежда като UI елемент. Обобщението НЕ пипа печатната
+// таблица въобще (твърде рисковано да позиционира точно) - пише се отделно,
+// също в мастилен стил, виж drawSummaryNote_ по-долу.
 async function drawGradingOverlay_(imageBuffer, tasks) {
   const meta = await sharp(imageBuffer).metadata();
   const W = meta.width, H = meta.height;
@@ -849,84 +851,60 @@ async function drawGradingOverlay_(imageBuffer, tasks) {
     y1: Math.round((box[2] / 1000) * H), x1: Math.round((box[3] / 1000) * W),
   });
   const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  const marks = (tasks || []).map((t) => {
+  const fmt = (n) => (Math.round(n * 10) / 10).toString();
+  const INK = '#c62828';
+  const marks = (tasks || []).map((t, i) => {
     if (!Array.isArray(t.box) || t.box.length !== 4) return '';
     const p = toPx(t.box);
-    const full = t.awardedPoints >= t.maxPoints;
     const zero = t.awardedPoints <= 0;
-    const color = full ? '#2e7d32' : zero ? '#c62828' : '#e65100';
-    const symbol = full ? '✓' : zero ? '✗' : '▲';
-    const cx = p.x1 + 14, cy = p.y0 + 4;
-    return '<g>' +
-      '<circle cx="' + cx + '" cy="' + cy + '" r="16" fill="white" stroke="' + color + '" stroke-width="2.5" />' +
-      '<text x="' + cx + '" y="' + (cy + 7) + '" font-size="20" font-weight="bold" fill="' + color + '" text-anchor="middle">' + symbol + '</text>' +
-      '<text x="' + (cx + 22) + '" y="' + (cy + 6) + '" font-size="15" font-weight="bold" fill="' + color + '">' + esc(t.awardedPoints) + '/' + esc(t.maxPoints) + '</text>' +
-      (t.note ? '<text x="' + (cx + 22) + '" y="' + (cy + 24) + '" font-size="11" fill="' + color + '">' + esc(t.note).slice(0, 40) + '</text>' : '') +
-      '</g>';
+    const boxH = Math.max(18, p.y1 - p.y0);
+    const fontSize = Math.max(18, Math.min(30, Math.round(boxH * 0.55)));
+    const cx = p.x1 + Math.round(fontSize * 0.7), cy = p.y0 + Math.round(boxH * 0.5) + Math.round(fontSize * 0.3);
+    const rot = ((i * 37) % 13) - 6; // псевдо-случайно, но стабилно наклонение за "на ръка" усещане
+    let g = '<g transform="rotate(' + rot + ' ' + cx + ' ' + cy + ')">' +
+      '<text x="' + cx + '" y="' + cy + '" font-size="' + fontSize + '" font-style="italic" font-weight="bold" ' +
+      'paint-order="stroke" stroke="white" stroke-width="' + Math.round(fontSize * 0.22) + '" stroke-linejoin="round" ' +
+      'fill="' + INK + '">' + esc(fmt(t.awardedPoints)) + '</text>';
+    if (zero) {
+      // Къса "подчертаваща" вълнообразна линия под отговора - типичен учителски жест при грешка.
+      const uy = p.y1 + 3;
+      g += '<path d="M ' + p.x0 + ' ' + uy + ' Q ' + Math.round((p.x0 + p.x1) / 2) + ' ' + (uy + 6) + ' ' + p.x1 + ' ' + uy + '" ' +
+        'fill="none" stroke="' + INK + '" stroke-width="2" />';
+    }
+    if (t.note) {
+      g += '<text x="' + cx + '" y="' + (cy + Math.round(fontSize * 0.85)) + '" font-size="' + Math.round(fontSize * 0.42) + '" ' +
+        'font-style="italic" paint-order="stroke" stroke="white" stroke-width="2.5" fill="' + INK + '">' + esc(t.note).slice(0, 40) + '</text>';
+    }
+    g += '</g>';
+    return g;
   }).join('\n');
   const svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' + marks + '</svg>';
   return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
 }
 
-// Добавя обобщителен "печат" (общо точки + оценка) в горния десен ъгъл -
-// FALLBACK, само когато НИТО една страница не показа печатна таблица
-// "Получени точки"/"Оценка" (drawSummaryTable_ по-долу не е приложимо) - по-
-// надеждно от опит да се познае таблица, която не съществува на снимката.
-async function drawSummaryStamp_(imageBuffer, totalAwarded, maxTotal, gradeLabel) {
-  const meta = await sharp(imageBuffer).metadata();
-  const W = meta.width;
-  const text = totalAwarded + ' / ' + maxTotal + (gradeLabel ? ('  (' + gradeLabel + ')') : '');
-  const boxW = Math.min(W - 20, 40 + text.length * 11);
-  const svg = '<svg width="' + W + '" height="60" xmlns="http://www.w3.org/2000/svg">' +
-    '<rect x="' + (W - boxW - 10) + '" y="8" width="' + boxW + '" height="40" rx="6" fill="white" stroke="#1a3a5c" stroke-width="2" />' +
-    '<text x="' + (W - boxW + 10) + '" y="34" font-size="22" font-weight="bold" fill="#1a3a5c">' + text.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</text>' +
-    '</svg>';
-  return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
-}
-
-// Попълва ДИРЕКТНО печатната таблица "Получени точки"/"Оценка" на листа -
-// 2026-11-07, по изрично искане на потребителя (показа реален пример на
-// ръчно анотирана работа - учителят пише точките В самите клетки на
-// таблицата, не отделен печат). pointsRowBox е КУТИЯТА НА ЦЕЛИЯ ред
-// (поискано от Gemini заради риска да познае 9 отделни клетки поотделно) -
-// тук се дели програмно на равни колони по БРОЯ ЗАДАЧИ + 1 (за "Общо"),
-// което е надеждно само ако таблицата има еднакви по широчина колони
-// (потвърдено на реалните тестове, виж примера на потребителя) - ако
-// бъдещ тест има различен формат, най-лошото е леко разминати цифри, не
-// грешни стойности.
-async function drawSummaryTable_(imageBuffer, tasksOrdered, totalAwarded, maxTotal, pointsRowBox, gradeBox, gradeLabel) {
+// Обобщение в мастилен стил, отделно от печатната таблица (която НЕ се
+// пипа - виж бележката при drawGradingOverlay_). Пише се винаги (не само
+// като fallback) в долния ляв ъгъл на последната успешно нарисувана
+// страница - достатъчно встрани от типичните печатни зони, за да не
+// застъпва условия/таблица.
+async function drawSummaryNote_(imageBuffer, tasksOrdered, totalAwarded, maxTotal, gradeLabel) {
   const meta = await sharp(imageBuffer).metadata();
   const W = meta.width, H = meta.height;
-  const toPx = (box) => ({
-    y0: Math.round((box[0] / 1000) * H), x0: Math.round((box[1] / 1000) * W),
-    y1: Math.round((box[2] / 1000) * H), x1: Math.round((box[3] / 1000) * W),
-  });
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
   const fmt = (n) => (Math.round(n * 10) / 10).toString();
-  let parts = '';
-
-  if (Array.isArray(pointsRowBox) && pointsRowBox.length === 4 && tasksOrdered.length > 0) {
-    const p = toPx(pointsRowBox);
-    const cols = tasksOrdered.length + 1; // +1 за "Общо"
-    const colW = (p.x1 - p.x0) / cols;
-    const cy = Math.round((p.y0 + p.y1) / 2) + 6;
-    const fontSize = Math.max(12, Math.min(22, Math.round((p.y1 - p.y0) * 0.6)));
-    tasksOrdered.forEach((t, i) => {
-      const cx = Math.round(p.x0 + colW * (i + 0.5));
-      parts += '<text x="' + cx + '" y="' + cy + '" font-size="' + fontSize + '" font-weight="bold" fill="#c62828" text-anchor="middle">' + fmt(t.awardedPoints) + '</text>';
-    });
-    const cxTotal = Math.round(p.x0 + colW * (cols - 0.5));
-    parts += '<text x="' + cxTotal + '" y="' + cy + '" font-size="' + fontSize + '" font-weight="bold" fill="#c62828" text-anchor="middle">' + fmt(totalAwarded) + '</text>';
+  const breakdown = tasksOrdered.map((t) => fmt(t.awardedPoints)).join('+');
+  const line1 = breakdown + ' = ' + fmt(totalAwarded) + ' / ' + fmt(maxTotal);
+  const line2 = gradeLabel ? ('Оценка: ' + gradeLabel) : '';
+  const x = Math.round(W * 0.04), y1 = H - 56, y2 = H - 22;
+  const INK = '#c62828';
+  const textStyle = 'font-style="italic" font-weight="bold" paint-order="stroke" stroke="white" stroke-linejoin="round" fill="' + INK + '"';
+  let svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' +
+    '<g transform="rotate(-2 ' + x + ' ' + y1 + ')">' +
+    '<text x="' + x + '" y="' + y1 + '" font-size="20" stroke-width="4" ' + textStyle + '>' + esc(line1) + '</text>';
+  if (line2) {
+    svg += '<text x="' + x + '" y="' + y2 + '" font-size="24" stroke-width="4.5" ' + textStyle + '>' + esc(line2) + '</text>';
   }
-
-  if (Array.isArray(gradeBox) && gradeBox.length === 4 && gradeLabel) {
-    const p = toPx(gradeBox);
-    const fontSize = Math.max(14, Math.min(24, Math.round((p.y1 - p.y0) * 0.75)));
-    const cy = Math.round((p.y0 + p.y1) / 2) + Math.round(fontSize * 0.35);
-    parts += '<text x="' + (p.x0 + 4) + '" y="' + cy + '" font-size="' + fontSize + '" font-weight="bold" fill="#c62828">' + gradeLabel.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</text>';
-  }
-
-  if (!parts) return imageBuffer;
-  const svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' + parts + '</svg>';
+  svg += '</g></svg>';
   return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
 }
 
@@ -1021,33 +999,24 @@ async function handleStartGradeWork(body) {
         const gradeLabel = parseGradeScaleLabel_(gradeScaleText, totalAwarded);
 
         // Етап 2 - вече знаем общия сбор, рисуваме: маркировка по задача на
-        // всяка страница + попълване на печатната таблица (ако е открита на
-        // която и да е страница).
+        // всяка страница + ОБОБЩЕНИЕ (в мастилен стил, винаги на последната
+        // успешно нарисувана страница - виж бележката при drawSummaryNote_
+        // защо вече НЕ пипаме печатната таблица директно).
         const pages = [];
-        let summaryDrawn = false;
         for (const pd of pageData) {
           if (pd.error) { pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', error: pd.error }); continue; }
           try {
-            let buf = await drawGradingOverlay_(pd.unmaskedBuf, pd.grading.tasks || []);
-            if (pd.grading.summaryPointsRowBox || pd.grading.summaryGradeBox) {
-              buf = await drawSummaryTable_(buf, allTasksOrdered, totalAwarded, maxTotal, pd.grading.summaryPointsRowBox, pd.grading.summaryGradeBox, gradeLabel);
-              summaryDrawn = true;
-            }
+            const buf = await drawGradingOverlay_(pd.unmaskedBuf, pd.grading.tasks || []);
             pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', buffer: buf, tasks: pd.grading.tasks || [] });
           } catch (e) {
             console.error('[gradeWork] грешка при рисуване за ' + name + ':', e.message);
             pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', error: e.message });
           }
         }
-        // Fallback - НИТО една страница няма печатна таблица (различен
-        // формат на теста) - общ печат в ъгъла на последната успешна страница,
-        // поне резултатът да се вижда някъде.
-        if (!summaryDrawn) {
-          for (let i = pages.length - 1; i >= 0; i--) {
-            if (!pages[i].buffer) continue;
-            try { pages[i].buffer = await drawSummaryStamp_(pages[i].buffer, totalAwarded, maxTotal, gradeLabel); } catch (e) { /* не е фатално */ }
-            break;
-          }
+        for (let i = pages.length - 1; i >= 0; i--) {
+          if (!pages[i].buffer) continue;
+          try { pages[i].buffer = await drawSummaryNote_(pages[i].buffer, allTasksOrdered, totalAwarded, maxTotal, gradeLabel); } catch (e) { /* не е фатално */ }
+          break;
         }
 
         const job = gradeJobs.get(jobId);
