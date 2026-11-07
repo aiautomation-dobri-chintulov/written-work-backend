@@ -446,7 +446,10 @@ async function handleListCourseWork(body) {
 // Classroom roster (courses.students.list) по userId от самото предаване -
 // Gemini никога не научава кой е ученикът, само вижда зачернена снимка.
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-2.0-flash';
+// gemini-2.0-flash е изтеглен от Google (потвърдено на живо 2026-11-07 -
+// грешка "is no longer available" по време на реален тест) - заменен с
+// текущия препоръчан наследник.
+const GEMINI_MODEL = 'gemini-3.8-flash';
 const NAME_BAND_FRACTION = 0.14; // горна част от снимката, зачернява се - там обичайно се пише ръкописно име/клас
 
 // Маскира снимка, която Е ВЕЧЕ малка (Drive thumbnail, виж fetchSubmissionImage_
@@ -791,6 +794,14 @@ const GRADE_TASK_SCHEMA = {
       },
     },
     gradeScaleText: { type: 'STRING' },
+    // "Получени точки" РЕД на обобщителната таблица (Задача 1 2 3... Общо) -
+    // ЕДНА кутия за целия ред, не по кутия на клетка (твърде рисковано да
+    // познае 9 отделни клетки точно) - ние после делим на равни колони по
+    // брой задачи, виж drawSummaryTable_. null, ако страницата няма такава
+    // таблица (типично - ако отговорите са на друга страница от решението).
+    summaryPointsRowBox: { type: 'ARRAY', items: { type: 'NUMBER' } },
+    // Празния ред "Оценка: ______" (само реда, не цялата таблица).
+    summaryGradeBox: { type: 'ARRAY', items: { type: 'NUMBER' } },
   },
   required: ['tasks'],
 };
@@ -812,6 +823,8 @@ async function gradeImageWithGemini_(ctx, imageBase64) {
     '4. Ако НЕ е присъдена пълната оценка, кратка бележка (до 10 думи) защо.\n' +
     '5. "box" - нормализирани координати [y_min, x_min, y_max, x_max] в скала 0-1000 спрямо ЦЯЛОТО изображение, сочещи мястото на РЪКОПИСНИЯ ОТГОВОР на ученика за тази задача (не отпечатаното условие).\n\n' +
     'Ако в долната част на страницата има таблица, превръщаща общ брой точки в оценка (напр. "0-8 Слаб2, 9-14 Среден3..."), препиши я като свободен текст в "gradeScaleText".\n' +
+    'Ако на страницата има обобщителна таблица с редове "Задача / Максимум точки / Получени точки" (празен ред "Получени точки" за попълване) - посочи "summaryPointsRowBox": нормализирани координати [y_min, x_min, y_max, x_max] на ЦЕЛИЯ празен ред "Получени точки" (от първата до последната клетка на реда, включително клетката "Общо"), НЕ на отделна клетка.\n' +
+    'Ако има отделен празен ред/поле "Оценка: ______" за попълване - посочи "summaryGradeBox": нормализирани координати само на празното място след "Оценка:".\n' +
     'Ако задача няма решение изобщо (празно поле), присъди 0 точки и отбележи "няма решение".\n' +
     'Пиши бележките на български.';
   const text = await callGemini_(
@@ -855,11 +868,10 @@ async function drawGradingOverlay_(imageBuffer, tasks) {
   return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
 }
 
-// Добавя обобщителен "печат" (общо точки + оценка) в горния десен ъгъл на
-// ПОСЛЕДНАТА страница - НЕ се опитва да позиционира в точната клетка на
-// печатната таблица "Получени точки/Оценка" (твърде рисковано за намиране
-// по координати), просто ясен печат, винаги на едно и също (надеждно)
-// място.
+// Добавя обобщителен "печат" (общо точки + оценка) в горния десен ъгъл -
+// FALLBACK, само когато НИТО една страница не показа печатна таблица
+// "Получени точки"/"Оценка" (drawSummaryTable_ по-долу не е приложимо) - по-
+// надеждно от опит да се познае таблица, която не съществува на снимката.
 async function drawSummaryStamp_(imageBuffer, totalAwarded, maxTotal, gradeLabel) {
   const meta = await sharp(imageBuffer).metadata();
   const W = meta.width;
@@ -870,6 +882,71 @@ async function drawSummaryStamp_(imageBuffer, totalAwarded, maxTotal, gradeLabel
     '<text x="' + (W - boxW + 10) + '" y="34" font-size="22" font-weight="bold" fill="#1a3a5c">' + text.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</text>' +
     '</svg>';
   return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
+}
+
+// Попълва ДИРЕКТНО печатната таблица "Получени точки"/"Оценка" на листа -
+// 2026-11-07, по изрично искане на потребителя (показа реален пример на
+// ръчно анотирана работа - учителят пише точките В самите клетки на
+// таблицата, не отделен печат). pointsRowBox е КУТИЯТА НА ЦЕЛИЯ ред
+// (поискано от Gemini заради риска да познае 9 отделни клетки поотделно) -
+// тук се дели програмно на равни колони по БРОЯ ЗАДАЧИ + 1 (за "Общо"),
+// което е надеждно само ако таблицата има еднакви по широчина колони
+// (потвърдено на реалните тестове, виж примера на потребителя) - ако
+// бъдещ тест има различен формат, най-лошото е леко разминати цифри, не
+// грешни стойности.
+async function drawSummaryTable_(imageBuffer, tasksOrdered, totalAwarded, maxTotal, pointsRowBox, gradeBox, gradeLabel) {
+  const meta = await sharp(imageBuffer).metadata();
+  const W = meta.width, H = meta.height;
+  const toPx = (box) => ({
+    y0: Math.round((box[0] / 1000) * H), x0: Math.round((box[1] / 1000) * W),
+    y1: Math.round((box[2] / 1000) * H), x1: Math.round((box[3] / 1000) * W),
+  });
+  const fmt = (n) => (Math.round(n * 10) / 10).toString();
+  let parts = '';
+
+  if (Array.isArray(pointsRowBox) && pointsRowBox.length === 4 && tasksOrdered.length > 0) {
+    const p = toPx(pointsRowBox);
+    const cols = tasksOrdered.length + 1; // +1 за "Общо"
+    const colW = (p.x1 - p.x0) / cols;
+    const cy = Math.round((p.y0 + p.y1) / 2) + 6;
+    const fontSize = Math.max(12, Math.min(22, Math.round((p.y1 - p.y0) * 0.6)));
+    tasksOrdered.forEach((t, i) => {
+      const cx = Math.round(p.x0 + colW * (i + 0.5));
+      parts += '<text x="' + cx + '" y="' + cy + '" font-size="' + fontSize + '" font-weight="bold" fill="#c62828" text-anchor="middle">' + fmt(t.awardedPoints) + '</text>';
+    });
+    const cxTotal = Math.round(p.x0 + colW * (cols - 0.5));
+    parts += '<text x="' + cxTotal + '" y="' + cy + '" font-size="' + fontSize + '" font-weight="bold" fill="#c62828" text-anchor="middle">' + fmt(totalAwarded) + '</text>';
+  }
+
+  if (Array.isArray(gradeBox) && gradeBox.length === 4 && gradeLabel) {
+    const p = toPx(gradeBox);
+    const fontSize = Math.max(14, Math.min(24, Math.round((p.y1 - p.y0) * 0.75)));
+    const cy = Math.round((p.y0 + p.y1) / 2) + Math.round(fontSize * 0.35);
+    parts += '<text x="' + (p.x0 + 4) + '" y="' + cy + '" font-size="' + fontSize + '" font-weight="bold" fill="#c62828">' + gradeLabel.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</text>';
+  }
+
+  if (!parts) return imageBuffer;
+  const svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' + parts + '</svg>';
+  return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
+}
+
+// Пресмята "Име (Число)" (напр. "Среден (3)") от свободния текст на
+// отпечатаната скала - 2026-11-07, по изрично искане на потребителя (реален
+// пример показа точно този формат, ръчно написан от учител). Regex търси
+// повтарящи се "мин – макс Име Число" групи; връща ПЪРВОТО съвпадение, в
+// чийто диапазон (вкл. границите) пада totalAwarded. Връща null при
+// непарсируем текст - по-добре празно поле, отколкото грешно познат номер.
+function parseGradeScaleLabel_(scaleText, totalAwarded) {
+  if (!scaleText) return null;
+  const re = /(\d+(?:[.,]\d+)?)\s*[-–—]\s*(\d+(?:[.,]\d+)?)\s*([^\d,;]+?)\s*(\d)(?=\s|[,;]|$)/gu;
+  let m;
+  while ((m = re.exec(scaleText)) !== null) {
+    const lo = parseFloat(m[1].replace(',', '.')), hi = parseFloat(m[2].replace(',', '.'));
+    if (totalAwarded >= lo && totalAwarded <= hi) {
+      return m[3].trim() + ' (' + m[4] + ')';
+    }
+  }
+  return null;
 }
 
 function makeGradeJobId_() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
@@ -914,31 +991,68 @@ async function handleStartGradeWork(body) {
       const results = await withConcurrency_(submissions, GRADE_CONCURRENCY, async (sub) => {
         const name = nameById[sub.userId] || sub.userId;
         const attachments = ((sub.assignmentSubmission || {}).attachments || []).filter((a) => a.driveFile);
-        const pages = [];
+
+        // Етап 1 - събира grading резултат за ВСЯКА страница ПРЕДИ да
+        // рисуваме каквото и да е - таблицата "Получени точки" (ако я има)
+        // трябва общия сбор от ВСИЧКИ страници, не само от своята собствена
+        // (виж бележката при GRADE_TASK_SCHEMA: в реалните тестове отговорите
+        // са на стр.1, таблицата - на стр.2).
+        const pageData = [];
         let totalAwarded = 0, maxTotal = 0, gradeScaleText = '';
+        const allTasksOrdered = [];
         for (const att of attachments) {
           try {
             const unmaskedBuf = await fetchSubmissionImage_(drive, driveAccessToken, att.driveFile.id);
             if (!unmaskedBuf) continue;
             const masked = await maskNameBand_(unmaskedBuf);
             const grading = await gradeImageWithGemini_(ctx, masked.toString('base64'));
-            (grading.tasks || []).forEach((t) => { totalAwarded += Number(t.awardedPoints) || 0; maxTotal += Number(t.maxPoints) || 0; });
+            (grading.tasks || []).forEach((t) => {
+              totalAwarded += Number(t.awardedPoints) || 0;
+              maxTotal += Number(t.maxPoints) || 0;
+              allTasksOrdered.push(t);
+            });
             if (grading.gradeScaleText) gradeScaleText = grading.gradeScaleText;
-            const marked = await drawGradingOverlay_(unmaskedBuf, grading.tasks || []);
-            pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', buffer: marked, tasks: grading.tasks || [] });
+            pageData.push({ unmaskedBuf, grading });
           } catch (e) {
             console.error('[gradeWork] грешка на страница за ' + name + ':', e.message);
+            pageData.push({ error: e.message });
+          }
+        }
+        const gradeLabel = parseGradeScaleLabel_(gradeScaleText, totalAwarded);
+
+        // Етап 2 - вече знаем общия сбор, рисуваме: маркировка по задача на
+        // всяка страница + попълване на печатната таблица (ако е открита на
+        // която и да е страница).
+        const pages = [];
+        let summaryDrawn = false;
+        for (const pd of pageData) {
+          if (pd.error) { pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', error: pd.error }); continue; }
+          try {
+            let buf = await drawGradingOverlay_(pd.unmaskedBuf, pd.grading.tasks || []);
+            if (pd.grading.summaryPointsRowBox || pd.grading.summaryGradeBox) {
+              buf = await drawSummaryTable_(buf, allTasksOrdered, totalAwarded, maxTotal, pd.grading.summaryPointsRowBox, pd.grading.summaryGradeBox, gradeLabel);
+              summaryDrawn = true;
+            }
+            pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', buffer: buf, tasks: pd.grading.tasks || [] });
+          } catch (e) {
+            console.error('[gradeWork] грешка при рисуване за ' + name + ':', e.message);
             pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', error: e.message });
           }
         }
-        if (pages.length > 0 && !pages[pages.length - 1].error) {
-          try {
-            pages[pages.length - 1].buffer = await drawSummaryStamp_(pages[pages.length - 1].buffer, totalAwarded, maxTotal, null);
-          } catch (e) { console.error('[gradeWork] неуспешен печат за ' + name + ':', e.message); }
+        // Fallback - НИТО една страница няма печатна таблица (различен
+        // формат на теста) - общ печат в ъгъла на последната успешна страница,
+        // поне резултатът да се вижда някъде.
+        if (!summaryDrawn) {
+          for (let i = pages.length - 1; i >= 0; i--) {
+            if (!pages[i].buffer) continue;
+            try { pages[i].buffer = await drawSummaryStamp_(pages[i].buffer, totalAwarded, maxTotal, gradeLabel); } catch (e) { /* не е фатално */ }
+            break;
+          }
         }
+
         const job = gradeJobs.get(jobId);
         if (job) job.done += 1;
-        return { name, userId: sub.userId, totalAwarded, maxTotal, gradeScaleText, pages, uploaded: false };
+        return { name, userId: sub.userId, totalAwarded, maxTotal, gradeScaleText, gradeLabel, pages, uploaded: false };
       });
 
       const job = gradeJobs.get(jobId);
@@ -978,7 +1092,7 @@ async function handleListGradeWorkResults(body) {
     }
     return {
       userId: r.userId, name: r.name, totalAwarded: r.totalAwarded, maxTotal: r.maxTotal,
-      gradeScaleText: r.gradeScaleText, pageCount: (r.pages || []).length, uploaded: !!r.uploaded, previewBase64,
+      gradeScaleText: r.gradeScaleText, gradeLabel: r.gradeLabel, pageCount: (r.pages || []).length, uploaded: !!r.uploaded, previewBase64,
     };
   }));
   return { ok: true, students };
@@ -990,7 +1104,8 @@ function handleGetGradeWorkPage(body) {
   const r = (job.results || []).find((x) => x.userId === body.userId);
   if (!r) return { error: 'Няма резултат за този ученик.' };
   const page = (r.pages || [])[body.pageIndex || 0];
-  if (!page || !page.buffer) return { error: 'Няма такава страница.' };
+  if (!page) return { error: 'Няма такава страница.' };
+  if (!page.buffer) return { error: page.error ? ('Грешка при тази страница: ' + page.error) : 'Няма такава страница.' };
   return { ok: true, base64: page.buffer.toString('base64'), pageCount: r.pages.length };
 }
 
