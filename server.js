@@ -752,6 +752,301 @@ function handleGetAnalyzeHomeworkStatus(body) {
   return { ok: true, status: job.status, done: job.done || 0, total: job.total || 0, fileName: job.fileName, pdfBase64: job.pdfBase64, error: job.error };
 }
 
+// --- AI проверка с анотация ("Проверени работи" -> AI режим) - 2026-11-07,
+// по изрично искане на потребителя: вместо само текстов анализ, AI да
+// ОЦЕНИ всяка задача по отпечатаните точки, да маркира (✓/✗/▲ + X/Y т.)
+// ДИРЕКТНО върху снимката на точното място на решението, и учителят да
+// прегледа/качи резултата в Classroom (НЕ автоматично - виж бележката при
+// handleConfirmUploadGradedWork).
+//
+// РИСК, признат изрично пред потребителя преди да се гради: за разлика от
+// дигитално генериран PDF (известни координати), тук Gemini трябва да
+// "познае" нормализирани bounding box координати (0-1000) на снимка от
+// телефон с произволен ъгъл/изрязване - НЕ Е жив тествано (Gemini billing
+// беше изчерпан по време на изграждането, потребителят избра "продължи без
+// тест"). Механиката на РИСУВАНЕ е потвърдена на ръка (sharp SVG composite,
+// виж теста с фиктивни кутии върху реална снимка - маркировките се
+// изчертаха коректно). Точността на САМИТЕ координати от Gemini остава за
+// проверка при първо живо пускане - ако се окаже системно неточна, лесно
+// се сваля до по-надежден "печат" (общ резултат в ъгъла, без opit за
+// позициониране по задача).
+const gradeJobs = new Map();
+const GRADE_CONCURRENCY = 3; // по-нисък от анализа (4) - всяка страница е 2 Gemini извиквания (grading) + повече sharp обработка (overlay)
+
+const GRADE_TASK_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    tasks: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          taskNumber: { type: 'STRING' },
+          maxPoints: { type: 'NUMBER' },
+          awardedPoints: { type: 'NUMBER' },
+          note: { type: 'STRING' },
+          box: { type: 'ARRAY', items: { type: 'NUMBER' } },
+        },
+        required: ['taskNumber', 'maxPoints', 'awardedPoints', 'box'],
+      },
+    },
+    gradeScaleText: { type: 'STRING' },
+  },
+  required: ['tasks'],
+};
+
+// Проверява ЕДНА страница - връща точки+бележка+bounding box за всяка
+// отпечатана задача на тази страница (bounding box = мястото на РЕШЕНИЕТО
+// на ученика, не на отпечатаното условие, за да сложим маркировката до
+// неговия отговор). gradeScaleText - ако на тази страница има отпечатана
+// таблица "точки -> оценка", преписва я като свободен текст (за показване
+// на учителя, не за автоматично парсене - различните тестове форматират
+// скалата различно).
+async function gradeImageWithGemini_(ctx, imageBase64) {
+  const promptText = 'Ти си учител по "' + ctx.subject + '" в ' + ctx.className + ' клас, проверяваш писмена/контролна работа. ' +
+    'На снимката има ОТПЕЧАТАНИ задачи, всяка с посочен максимален брой точки до условието (напр. "2 т.", "4 т."), и РЪКОПИСНО решение на ученика.\n\n' +
+    'За ВСЯКА отпечатана задача на СТРАНИЦАТА:\n' +
+    '1. Номер на задачата точно както е отпечатан (напр. "1", "4а", "7").\n' +
+    '2. Максимален брой точки - прочети го от отпечатаното "N т." до условието.\n' +
+    '3. Прецени ръкописното решение на ученика и присъди точки от 0 до максимума (може и половин точки), според това колко е вярно/пълно.\n' +
+    '4. Ако НЕ е присъдена пълната оценка, кратка бележка (до 10 думи) защо.\n' +
+    '5. "box" - нормализирани координати [y_min, x_min, y_max, x_max] в скала 0-1000 спрямо ЦЯЛОТО изображение, сочещи мястото на РЪКОПИСНИЯ ОТГОВОР на ученика за тази задача (не отпечатаното условие).\n\n' +
+    'Ако в долната част на страницата има таблица, превръщаща общ брой точки в оценка (напр. "0-8 Слаб2, 9-14 Среден3..."), препиши я като свободен текст в "gradeScaleText".\n' +
+    'Ако задача няма решение изобщо (празно поле), присъди 0 точки и отбележи "няма решение".\n' +
+    'Пиши бележките на български.';
+  const text = await callGemini_(
+    [{ text: promptText }, { inlineData: { mimeType: 'image/jpeg', data: imageBase64 } }],
+    { responseMimeType: 'application/json', responseSchema: GRADE_TASK_SCHEMA }
+  );
+  return JSON.parse(text);
+}
+
+// Рисува маркировките (✓ зелено/✗ червено/▲ оранжево + "X/Y") ДИРЕКТНО
+// върху снимката, на мястото, посочено от Gemini - sharp SVG composite,
+// потвърдено на ръка с фиктивни координати преди да се вгради тук (виж
+// бележката по-горе). Работи върху НЕМАСКИРАНАТА снимка (тази, която
+// реално отива в Classroom - за разлика от writtenWork-анализа, тук НЯМА
+// нужда от псевдонимизация на изхода, само на входа към Gemini, виж
+// handleStartGradeWork).
+async function drawGradingOverlay_(imageBuffer, tasks) {
+  const meta = await sharp(imageBuffer).metadata();
+  const W = meta.width, H = meta.height;
+  const toPx = (box) => ({
+    y0: Math.round((box[0] / 1000) * H), x0: Math.round((box[1] / 1000) * W),
+    y1: Math.round((box[2] / 1000) * H), x1: Math.round((box[3] / 1000) * W),
+  });
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const marks = (tasks || []).map((t) => {
+    if (!Array.isArray(t.box) || t.box.length !== 4) return '';
+    const p = toPx(t.box);
+    const full = t.awardedPoints >= t.maxPoints;
+    const zero = t.awardedPoints <= 0;
+    const color = full ? '#2e7d32' : zero ? '#c62828' : '#e65100';
+    const symbol = full ? '✓' : zero ? '✗' : '▲';
+    const cx = p.x1 + 14, cy = p.y0 + 4;
+    return '<g>' +
+      '<circle cx="' + cx + '" cy="' + cy + '" r="16" fill="white" stroke="' + color + '" stroke-width="2.5" />' +
+      '<text x="' + cx + '" y="' + (cy + 7) + '" font-size="20" font-weight="bold" fill="' + color + '" text-anchor="middle">' + symbol + '</text>' +
+      '<text x="' + (cx + 22) + '" y="' + (cy + 6) + '" font-size="15" font-weight="bold" fill="' + color + '">' + esc(t.awardedPoints) + '/' + esc(t.maxPoints) + '</text>' +
+      (t.note ? '<text x="' + (cx + 22) + '" y="' + (cy + 24) + '" font-size="11" fill="' + color + '">' + esc(t.note).slice(0, 40) + '</text>' : '') +
+      '</g>';
+  }).join('\n');
+  const svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' + marks + '</svg>';
+  return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
+}
+
+// Добавя обобщителен "печат" (общо точки + оценка) в горния десен ъгъл на
+// ПОСЛЕДНАТА страница - НЕ се опитва да позиционира в точната клетка на
+// печатната таблица "Получени точки/Оценка" (твърде рисковано за намиране
+// по координати), просто ясен печат, винаги на едно и също (надеждно)
+// място.
+async function drawSummaryStamp_(imageBuffer, totalAwarded, maxTotal, gradeLabel) {
+  const meta = await sharp(imageBuffer).metadata();
+  const W = meta.width;
+  const text = totalAwarded + ' / ' + maxTotal + (gradeLabel ? ('  (' + gradeLabel + ')') : '');
+  const boxW = Math.min(W - 20, 40 + text.length * 11);
+  const svg = '<svg width="' + W + '" height="60" xmlns="http://www.w3.org/2000/svg">' +
+    '<rect x="' + (W - boxW - 10) + '" y="8" width="' + boxW + '" height="40" rx="6" fill="white" stroke="#1a3a5c" stroke-width="2" />' +
+    '<text x="' + (W - boxW + 10) + '" y="34" font-size="22" font-weight="bold" fill="#1a3a5c">' + text.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</text>' +
+    '</svg>';
+  return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
+}
+
+function makeGradeJobId_() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+async function handleStartGradeWork(body) {
+  const { teacherEmail, subject, className, courseId, courseWorkId } = body;
+  if (!teacherEmail || !courseId || !courseWorkId) return { error: 'Липсват задължителни данни.' };
+  if (!GEMINI_API_KEY) return { error: 'GEMINI_API_KEY не е зададен на Render backend-а.' };
+
+  const classroomWork = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
+  const classroomRoster = google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) });
+  const driveAuthClient = teacherDriveAuth(teacherEmail);
+  const drive = google.drive({ version: 'v3', auth: driveAuthClient });
+  const { token: driveAccessToken } = await driveAuthClient.getAccessToken();
+
+  let roster;
+  try {
+    const res = await classroomRoster.courses.students.list({ courseId });
+    roster = res.data.students || [];
+  } catch (e) {
+    return { error: 'Грешка при четене на списъка с ученици: ' + describeApiError_(e) };
+  }
+  const nameById = {};
+  roster.forEach((s) => {
+    nameById[s.userId] = (s.profile && s.profile.name && s.profile.name.fullName) || s.userId;
+  });
+
+  let submissions;
+  try {
+    const res = await classroomWork.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId });
+    submissions = (res.data.studentSubmissions || []).filter((s) => s.state === 'TURNED_IN' || s.state === 'RETURNED');
+  } catch (e) {
+    return { error: 'Грешка при четене на предаванията: ' + describeApiError_(e) };
+  }
+
+  const ctx = { subject: subject || '', className: className || '' };
+  const jobId = makeGradeJobId_();
+  gradeJobs.set(jobId, { status: 'running', done: 0, total: submissions.length, createdAt: Date.now(), teacherEmail, courseId, courseWorkId, results: [] });
+
+  (async () => {
+    try {
+      const results = await withConcurrency_(submissions, GRADE_CONCURRENCY, async (sub) => {
+        const name = nameById[sub.userId] || sub.userId;
+        const attachments = ((sub.assignmentSubmission || {}).attachments || []).filter((a) => a.driveFile);
+        const pages = [];
+        let totalAwarded = 0, maxTotal = 0, gradeScaleText = '';
+        for (const att of attachments) {
+          try {
+            const unmaskedBuf = await fetchSubmissionImage_(drive, driveAccessToken, att.driveFile.id);
+            if (!unmaskedBuf) continue;
+            const masked = await maskNameBand_(unmaskedBuf);
+            const grading = await gradeImageWithGemini_(ctx, masked.toString('base64'));
+            (grading.tasks || []).forEach((t) => { totalAwarded += Number(t.awardedPoints) || 0; maxTotal += Number(t.maxPoints) || 0; });
+            if (grading.gradeScaleText) gradeScaleText = grading.gradeScaleText;
+            const marked = await drawGradingOverlay_(unmaskedBuf, grading.tasks || []);
+            pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', buffer: marked, tasks: grading.tasks || [] });
+          } catch (e) {
+            console.error('[gradeWork] грешка на страница за ' + name + ':', e.message);
+            pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', error: e.message });
+          }
+        }
+        if (pages.length > 0 && !pages[pages.length - 1].error) {
+          try {
+            pages[pages.length - 1].buffer = await drawSummaryStamp_(pages[pages.length - 1].buffer, totalAwarded, maxTotal, null);
+          } catch (e) { console.error('[gradeWork] неуспешен печат за ' + name + ':', e.message); }
+        }
+        const job = gradeJobs.get(jobId);
+        if (job) job.done += 1;
+        return { name, userId: sub.userId, totalAwarded, maxTotal, gradeScaleText, pages, uploaded: false };
+      });
+
+      const job = gradeJobs.get(jobId);
+      if (job) { job.results = results; job.status = 'done'; }
+    } catch (e) {
+      console.error('[gradeWork] job ' + jobId + ' гръмна:', e.message);
+      gradeJobs.set(jobId, { status: 'error', error: e.message });
+    }
+    setTimeout(() => gradeJobs.delete(jobId), 30 * 60 * 1000).unref();
+  })();
+
+  return { ok: true, jobId, total: submissions.length };
+}
+
+function handleGetGradeWorkStatus(body) {
+  const job = gradeJobs.get(body.jobId);
+  if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
+  return { ok: true, status: job.status, done: job.done || 0, total: job.total || 0, error: job.error };
+}
+
+// Връща ЛЕКА преглед-версия (малки, компресирани снимки, само ПЪРВАТА
+// страница на всеки ученик) - пълните страници се теглят поотделно при
+// нужда (getGradeWorkPage), за да не блъскаме google.script.run лимита за
+// размер на еднократен отговор с 20+ пълноразмерни анотирани снимки накуп.
+async function handleListGradeWorkResults(body) {
+  const job = gradeJobs.get(body.jobId);
+  if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
+  if (job.status !== 'done') return { error: 'Задачата още не е готова (статус: ' + job.status + ').' };
+  const students = await Promise.all((job.results || []).map(async (r) => {
+    let previewBase64 = null;
+    const firstOkPage = (r.pages || []).find((p) => p.buffer);
+    if (firstOkPage) {
+      try {
+        const small = await sharp(firstOkPage.buffer).resize({ width: 500, withoutEnlargement: true }).jpeg({ quality: 70 }).toBuffer();
+        previewBase64 = small.toString('base64');
+      } catch (e) { /* без преглед, не е фатално */ }
+    }
+    return {
+      userId: r.userId, name: r.name, totalAwarded: r.totalAwarded, maxTotal: r.maxTotal,
+      gradeScaleText: r.gradeScaleText, pageCount: (r.pages || []).length, uploaded: !!r.uploaded, previewBase64,
+    };
+  }));
+  return { ok: true, students };
+}
+
+function handleGetGradeWorkPage(body) {
+  const job = gradeJobs.get(body.jobId);
+  if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
+  const r = (job.results || []).find((x) => x.userId === body.userId);
+  if (!r) return { error: 'Няма резултат за този ученик.' };
+  const page = (r.pages || [])[body.pageIndex || 0];
+  if (!page || !page.buffer) return { error: 'Няма такава страница.' };
+  return { ok: true, base64: page.buffer.toString('base64'), pageCount: r.pages.length };
+}
+
+// Качва ВСИЧКИ анотирани страници на ЕДИН ученик в Classroom - учителят е
+// прегледал преди това (виж 'Учителят преглежда преди изпращане' избора
+// при изграждането - AI НИКОГА не качва само̀ без този бутон). Преизползва
+// СЪЩАТА Drive+Classroom логика като handleAttachGraded (ръчното качване),
+// само източникът на байтовете е кешираната AI-анотирана снимка, не файл
+// от диска на учителя. Идентифицира ученика по НУМЕРИЧНИЯ userId, вече
+// наличен от самото предаване (studentSubmissions.list) - НЕ по email
+// (Classroom roster API емпирично НЕ връща profile.emailAddress за този
+// домейн/service account, потвърдено на живо 2026-11-07) и НЕ по name-match
+// (resolveStudentId_ съществува за друг случай - тук userId вече го имаме).
+async function handleConfirmUploadGradedWork(body) {
+  const job = gradeJobs.get(body.jobId);
+  if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
+  const r = (job.results || []).find((x) => x.userId === body.userId);
+  if (!r) return { error: 'Няма резултат за този ученик.' };
+
+  const auth = teacherDriveAuth(job.teacherEmail);
+  const classroom = google.classroom({ version: 'v1', auth });
+  const drive = google.drive({ version: 'v3', auth });
+
+  let submission;
+  try {
+    const res = await classroom.courses.courseWork.studentSubmissions.list({ courseId: job.courseId, courseWorkId: job.courseWorkId, userId: r.userId });
+    submission = (res.data.studentSubmissions || [])[0] || null;
+  } catch (e) {
+    return { error: 'Грешка при четене на submission: ' + describeApiError_(e) };
+  }
+  if (!submission) return { error: 'Няма предаване за ' + r.name + '.' };
+
+  const okPages = (r.pages || []).filter((p) => p.buffer);
+  if (okPages.length === 0) return { error: 'Няма успешно анотирани страници за ' + r.name + '.' };
+
+  try {
+    for (const page of okPages) {
+      const uploaded = await drive.files.create({
+        requestBody: { name: 'AI проверка - ' + page.fileName },
+        media: { mimeType: 'image/jpeg', body: Readable.from(page.buffer) },
+        fields: 'id',
+      });
+      await classroom.courses.courseWork.studentSubmissions.modifyAttachments({
+        courseId: job.courseId, courseWorkId: job.courseWorkId, id: submission.id,
+        requestBody: { addAttachments: [{ driveFile: { id: uploaded.data.id } }] },
+      });
+    }
+  } catch (e) {
+    console.error('[confirmUploadGradedWork]', r.name, describeApiError_(e));
+    return { error: 'Грешка при качване: ' + describeApiError_(e) };
+  }
+
+  r.uploaded = true;
+  return { ok: true, note: 'Качени ' + okPages.length + ' страница(и) за ' + r.name + '.' };
+}
+
 const app = express();
 app.use(express.json({ limit: '15mb' })); // снимки/PDF-и като base64 могат да са няколко MB
 
@@ -773,6 +1068,11 @@ app.post('/', async (req, res) => {
     if (body.action === 'updateAnnotated') { res.json(await handleUpdateAnnotated(body)); return; }
     if (body.action === 'startHomeworkAnalysis') { res.json(await handleStartAnalyzeHomework(body)); return; }
     if (body.action === 'getHomeworkAnalysisStatus') { res.json(handleGetAnalyzeHomeworkStatus(body)); return; }
+    if (body.action === 'startGradeWork') { res.json(await handleStartGradeWork(body)); return; }
+    if (body.action === 'getGradeWorkStatus') { res.json(handleGetGradeWorkStatus(body)); return; }
+    if (body.action === 'listGradeWorkResults') { res.json(await handleListGradeWorkResults(body)); return; }
+    if (body.action === 'getGradeWorkPage') { res.json(handleGetGradeWorkPage(body)); return; }
+    if (body.action === 'confirmUploadGradedWork') { res.json(await handleConfirmUploadGradedWork(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
     res.status(500).json({ error: e.message });
