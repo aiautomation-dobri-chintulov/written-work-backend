@@ -491,6 +491,33 @@ async function fetchSubmissionImage_(drive, accessToken, fileId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+// Прикачените файлове НА САМОТО ЗАДАНИЕ (courseWork.materials - напр. ключ
+// с отговори, оригиналният тест, рубрика), НЕ ученическата работа -
+// 2026-11-09, по изрично искане на потребителя ("да се гледа освен темата и
+// заданието и приложените файлове"): до момента и анализът на домашни, и AI
+// проверката четяха само заглавие+описание на заданието (courseWork.title/
+// description), без реално съдържание на прикачените материали. Връща до
+// MAX изображения (base64, без маскиране - това са УЧИТЕЛСКИ материали, не
+// ученически PII) - ограничено нарочно, за да не оскъпим/забавим всяка
+// Gemini заявка допълнително; материали без driveFile (линк/YouTube/Форма)
+// или нечетими от Drive thumbnail се пропускат тихо, не е фатално.
+async function fetchAssignmentMaterialImages_(drive, accessToken, courseWork, max) {
+  const materials = (courseWork && courseWork.materials) || [];
+  const images = [];
+  for (const m of materials) {
+    if (images.length >= (max || 3)) break;
+    const fileId = m.driveFile && m.driveFile.driveFile && m.driveFile.driveFile.id;
+    if (!fileId) continue;
+    try {
+      const buf = await fetchSubmissionImage_(drive, accessToken, fileId);
+      if (buf) images.push(buf.toString('base64'));
+    } catch (e) {
+      console.error('[assignmentMaterials] неуспешно изтегляне на ' + fileId + ':', e.message);
+    }
+  }
+  return images;
+}
+
 // Прост concurrency pool - 2026-11-07, по реален тест на цял клас: последователна
 // (един по един) обработка на ученици е прекалено бавна за синхронна HTTP
 // заявка (виж бележката при startAnalyzeHomeworkJob_ за пълната история защо
@@ -538,11 +565,14 @@ async function analyzeStudentSubmission_(ctx, images) {
     'Заглавие: ' + ctx.title + '\n' +
     (ctx.topicName ? ('Тема: ' + ctx.topicName + '\n') : '') +
     (ctx.description ? ('Указания: ' + ctx.description + '\n') : '') +
+    (ctx.materialImages && ctx.materialImages.length ? '\nСлед тази инструкция следват ПРИКАЧЕНИТЕ КЪМ ЗАДАНИЕТО файлове (условие, ключ с отговори или рубрика, ако учителят ги е добавил) - използвай ги като референция за правилния отговор/критериите. ' : '') +
     '\nПрегледай снимките (условието на задачата и решението на ученика са на самите снимки) и провери дали решението е вярно. ' +
     'В полето "errors" изброй КОНКРЕТНИ грешки - кратко, по една точка на елемент (ако няма грешки, върни празен списък []). ' +
     'В "summary" напиши 1-2 изречения обща оценка на представянето. Пиши на български.\n' +
-    'ВАЖНО: горната част на всяка снимка е умишлено зачернена (скрито е името на ученика) - това НЕ Е част от решението, игнорирай я напълно.';
+    'ВАЖНО: горната част на всяка снимка на УЧЕНИКА е умишлено зачернена (скрито е името на ученика) - това НЕ Е част от решението, игнорирай я напълно.';
   const parts = [{ text: promptText }];
+  (ctx.materialImages || []).forEach((b64) => { parts.push({ inlineData: { mimeType: 'image/jpeg', data: b64 } }); });
+  if (ctx.materialImages && ctx.materialImages.length) parts.push({ text: 'Сега следват снимките на РЕШЕНИЕТО на ученика:' });
   images.forEach((img) => { parts.push({ inlineData: { mimeType: img.mimeType, data: img.base64 } }); });
   const text = await callGemini_(parts, { responseMimeType: 'application/json', responseSchema: STUDENT_ANALYSIS_SCHEMA });
   return JSON.parse(text);
@@ -680,7 +710,8 @@ async function handleStartAnalyzeHomework(body) {
     return { error: 'Грешка при четене на предаванията: ' + describeApiError_(e) };
   }
 
-  const ctx = { subject: subject || '', className: className || '', title: courseWork.title || '', topicName, description: courseWork.description || '' };
+  const materialImages = await fetchAssignmentMaterialImages_(drive, driveAccessToken, courseWork, 3);
+  const ctx = { subject: subject || '', className: className || '', title: courseWork.title || '', topicName, description: courseWork.description || '', materialImages };
   const jobId = makeJobId_();
   analysisJobs.set(jobId, { status: 'running', done: 0, total: submissions.length, createdAt: Date.now() });
 
@@ -788,6 +819,13 @@ const GRADE_TASK_SCHEMA = {
           maxPoints: { type: 'NUMBER' },
           awardedPoints: { type: 'NUMBER' },
           note: { type: 'STRING' },
+          // 2026-11-09, по изрично искане на потребителя (прегледа подробен
+          // промпт за ръчна проверка, по който бе направен примерът
+          // "Виктория Кирилова.pdf"): КРАТКО вярно решение/отговор, само
+          // когато awardedPoints < maxPoints - НЕ цялостна обосновка
+          // (виж drawGradingOverlay_ защо дължината е ограничена - статично
+          // SVG поле, не истинско PDF писане с преценка за свободно място).
+          correctSolution: { type: 'STRING' },
           box: { type: 'ARRAY', items: { type: 'NUMBER' } },
         },
         required: ['taskNumber', 'maxPoints', 'awardedPoints', 'box'],
@@ -830,22 +868,34 @@ const GRADE_TASK_SCHEMA = {
 // скалата различно).
 async function gradeImageWithGemini_(ctx, imageBase64) {
   const promptText = 'Ти си учител по "' + ctx.subject + '" в ' + ctx.className + ' клас, проверяваш писмена/контролна работа. ' +
-    'На снимката има ОТПЕЧАТАНИ задачи, всяка с посочен максимален брой точки до условието (напр. "2 т.", "4 т."), и РЪКОПИСНО решение на ученика.\n\n' +
+    'На снимката има ОТПЕЧАТАНИ задачи, всяка с посочен максимален брой точки до условието (напр. "2 т.", "4 т."), и РЪКОПИСНО решение на ученика. ' +
+    'Не приемай предварително фиксиран брой задачи, точки или скала - прочети ги точно от тази страница.\n' +
+    (ctx.assignmentTitle ? ('Заглавие на заданието: ' + ctx.assignmentTitle + '\n') : '') +
+    (ctx.assignmentDescription ? ('Указания на учителя за заданието: ' + ctx.assignmentDescription + '\n') : '') +
+    (ctx.materialImages && ctx.materialImages.length ? 'След тази инструкция следват ПРИКАЧЕНИ КЪМ ЗАДАНИЕТО файлове (напр. ключ с отговори, рубрика или оригиналният тест) - НЕ СА ученическата работа, използвай ги само като референция за правилните отговори/критериите, преди да видиш снимката на ученика.\n' : '') +
+    '\n' +
     'За ВСЯКА отпечатана задача на СТРАНИЦАТА:\n' +
     '1. Номер на задачата точно както е отпечатан (напр. "1", "4а", "7").\n' +
     '2. Максимален брой точки - прочети го от отпечатаното "N т." до условието.\n' +
-    '3. Прецени ръкописното решение на ученика и присъди точки от 0 до максимума (може и половин точки), според това колко е вярно/пълно.\n' +
-    '4. Ако НЕ е присъдена пълната оценка, кратка бележка (до 10 думи) защо.\n' +
-    '5. "box" - нормализирани координати [y_min, x_min, y_max, x_max] в скала 0-1000 спрямо ЦЯЛОТО изображение, сочещи мястото на РЪКОПИСНИЯ ОТГОВОР на ученика за тази задача (не отпечатаното условие).\n\n' +
+    '3. Оцени не само крайния отговор, но и правилния подход, показаното разбиране, междинните стъпки и използването на верни термини/единици. Ако ученикът е зачертал решение и го е заменил с друго - оцени ЗАМЕНЯЩОТО (последното, незачертано) решение, не зачертаното. Присъди точки от 0 до максимума (позволени са и половин точки), според тази стъпаловидна скала (освен ако тестът явно дава собствени по-подробни критерии - тогава следвай тях):\n' +
+    '   - пълен и верен отговор/подход -> пълния брой точки;\n' +
+    '   - основно верен отговор с дребна грешка или пропуск -> малко намаление;\n' +
+    '   - съществено правилна част, но непълен или частично грешен отговор -> около половината точки;\n' +
+    '   - смислено начало или отделен верен елемент -> малък брой точки;\n' +
+    '   - липса на каквато и да е релевантна правилна работа -> 0 точки (НЕ присъждай 0, ако има смислена частично вярна работа).\n' +
+    '4. "note" - кратка конкретна бележка (до 8 думи) САМО ако точките са под максимума, по възможност от този тип: "Непълен отговор", "Липсва обосновка", "Фактическа грешка", "Неточна дата", "Объркана причина и следствие", "Грешна единица", "Верен подход, но изчислителна грешка", "Липсва вторият изискван елемент", "няма решение" - или друга също толкова конкретна и кратка.\n' +
+    '5. "correctSolution" - САМО ако точките са под максимума: много кратко (до 25 знака за изчислителни предмети, до 40 знака за хуманитарни) вярното решение/отговор или ключовият липсващ елемент - достатъчно малко, за да се побере на страницата до отговора. При отворени/аргументативни задачи (литература, история, есе) не изисквай единствен възможен отговор - посочи най-важния очакван елемент по критериите, не цяло съчинение.\n' +
+    '6. "box" - нормализирани координати [y_min, x_min, y_max, x_max] в скала 0-1000 спрямо ЦЯЛОТО изображение, сочещи мястото на РЪКОПИСНИЯ ОТГОВОР на ученика за тази задача (не отпечатаното условие).\n\n' +
     'Ако в долната част на страницата има таблица, превръщаща общ брой точки в оценка (напр. "0-8 Слаб2, 9-14 Среден3..."), препиши я като свободен текст в "gradeScaleText".\n' +
     'Ако на страницата има обобщителна таблица с ред "Получени точки" (празни клетки за попълване, по една на задача, плюс клетка "Общо") - за ВСЯКА празна клетка посочи "summaryPointsCells": {"taskNumber": номера на съответната задача, "box": нормализирани координати НА ТАЗИ КОНКРЕТНА празна клетка (не на целия ред)}. Ако има и празна клетка "Общо" в същия ред - посочи координатите ѝ в "summaryTotalBox".\n' +
     'Ако има отделен празен ред/поле "Оценка: ______" за попълване - посочи "summaryGradeBox": координати само на празното място след "Оценка:".\n' +
     'Ако задача няма решение изобщо (празно поле), присъди 0 точки и отбележи "няма решение".\n' +
     'Пиши бележките на български.';
-  const text = await callGemini_(
-    [{ text: promptText }, { inlineData: { mimeType: 'image/jpeg', data: imageBase64 } }],
-    { responseMimeType: 'application/json', responseSchema: GRADE_TASK_SCHEMA }
-  );
+  const parts = [{ text: promptText }];
+  (ctx.materialImages || []).forEach((b64) => { parts.push({ inlineData: { mimeType: 'image/jpeg', data: b64 } }); });
+  if (ctx.materialImages && ctx.materialImages.length) parts.push({ text: 'Сега следва снимката на РАБОТАТА на ученика, която трябва да провериш:' });
+  parts.push({ inlineData: { mimeType: 'image/jpeg', data: imageBase64 } });
+  const text = await callGemini_(parts, { responseMimeType: 'application/json', responseSchema: GRADE_TASK_SCHEMA });
   return JSON.parse(text);
 }
 
@@ -896,10 +946,25 @@ async function drawGradingOverlay_(imageBuffer, tasks) {
       g += '<path d="M ' + p.x0 + ' ' + uy + ' Q ' + Math.round((p.x0 + p.x1) / 2) + ' ' + (uy + 6) + ' ' + p.x1 + ' ' + uy + '" ' +
         'fill="none" stroke="' + INK + '" stroke-width="2" />';
     }
-    if (t.note) {
-      g += '<text x="' + cx + '" y="' + (cy + Math.round(fontSize * 0.85)) + '" font-size="' + Math.round(fontSize * 0.42) + '" ' +
-        'font-style="italic" paint-order="stroke" stroke="white" stroke-width="2.5" fill="' + INK + '">' + esc(t.note).slice(0, 40) + '</text>';
-    }
+    // Бележка (защо) + кратко вярно решение (какво) - всяка на отделен ред
+    // под числото точки, по-дребен шрифт. correctSolution - 2026-11-09, по
+    // изрично искане на потребителя (прегледа подробен ръчен промпт за
+    // проверка) - съзнателно кратко (виж gradeImageWithGemini_), тъй като
+    // тук НЯМА преценка за свободно място като в истинско PDF писане.
+    const smallFont = Math.round(fontSize * 0.42);
+    const extraLines = [t.note ? esc(t.note).slice(0, 40) : '', t.correctSolution ? ('→ ' + esc(t.correctSolution).slice(0, 40)) : ''].filter(Boolean);
+    // Ако cx е близо до десния край на страницата (чести отговори, опрени
+    // в полето "РЕШЕНИЕ"), по-дългият текст на бележката/решението просто
+    // излизаше извън снимката - 2026-11-09, засечено на реален тест. Закотвяме
+    // края на текста точно под cx (text-anchor="end") вместо началото, за да
+    // расте НАЛЯВО и да остане на страницата, без да пипаме cx на самото число.
+    const nearRightEdge = cx > W - 160;
+    extraLines.forEach((line, li) => {
+      const ey = cy + Math.round(fontSize * 0.85) + li * Math.round(smallFont * 1.25);
+      g += '<text x="' + cx + '" y="' + ey + '" font-size="' + smallFont + '" ' +
+        (nearRightEdge ? 'text-anchor="end" ' : '') +
+        'font-style="italic" paint-order="stroke" stroke="white" stroke-width="2.5" fill="' + INK + '">' + line + '</text>';
+    });
     g += '</g>';
     return g;
   }).join('\n');
@@ -1023,7 +1088,21 @@ async function handleStartGradeWork(body) {
     return { error: 'Грешка при четене на предаванията: ' + describeApiError_(e) };
   }
 
-  const ctx = { subject: subject || '', className: className || '' };
+  // Заглавие/описание/прикачени файлове НА САМОТО ЗАДАНИЕ (не грешка, ако
+  // не успеем - продължаваме само с ученическата снимка) - 2026-11-09, по
+  // изрично искане на потребителя ("да се гледа освен темата и заданието и
+  // приложените файлове"), виж fetchAssignmentMaterialImages_ по-горе.
+  let assignmentTitle = '', assignmentDescription = '', materialImages = [];
+  try {
+    const cwRes = await classroomWork.courses.courseWork.get({ courseId, id: courseWorkId });
+    assignmentTitle = cwRes.data.title || '';
+    assignmentDescription = cwRes.data.description || '';
+    materialImages = await fetchAssignmentMaterialImages_(drive, driveAccessToken, cwRes.data, 3);
+  } catch (e) {
+    console.error('[gradeWork] неуспешно четене на заданието (продължавам без него):', describeApiError_(e));
+  }
+
+  const ctx = { subject: subject || '', className: className || '', assignmentTitle, assignmentDescription, materialImages };
   const jobId = makeGradeJobId_();
   gradeJobs.set(jobId, { status: 'running', done: 0, total: submissions.length, createdAt: Date.now(), teacherEmail, courseId, courseWorkId, results: [] });
 
