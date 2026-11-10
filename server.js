@@ -1128,22 +1128,28 @@ async function fillSummaryCells_(imageBuffer, pointsCells, totalBox, totalAwarde
 // теста, виж fillSummaryCells_ по-горе, който се пробва първо). Пише се в
 // долния ляв ъгъл на последната успешно нарисувана страница - достатъчно
 // встрани от типичните печатни зони, за да не застъпва условия/таблица.
-async function drawSummaryNote_(imageBuffer, tasksOrdered, totalAwarded, maxTotal, gradeLabel) {
+// 2026-11-10, опростено по реален случай - предишната версия изписваше и
+// разбивка по задача ("0+0+2+2+0+2+4+2 = 12 / 30"), но тънките "+"/"="
+// изчезваха зад бялата "ореола" на съседните цифри при толкова плътно
+// събран текст (четеше се като безсмислено "0220242"). Разбивката вече и
+// без друго е излишна тук - всяка задача вече си има собствена ръкописна
+// марка до отговора (виж drawGradingOverlay_), затова печатът сега показва
+// само общия резултат - по-кратко, нищо тясно за счупване.
+async function drawSummaryNote_(imageBuffer, totalAwarded, maxTotal, gradeLabel) {
   const meta = await sharp(imageBuffer).metadata();
   const W = meta.width, H = meta.height;
   const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
   const fmt = (n) => (Math.round(n * 10) / 10).toString();
-  const breakdown = tasksOrdered.map((t) => fmt(t.awardedPoints)).join('+');
-  const line1 = breakdown + ' = ' + fmt(totalAwarded) + ' / ' + fmt(maxTotal);
+  const line1 = 'Общо: ' + fmt(totalAwarded) + ' / ' + fmt(maxTotal);
   const line2 = gradeLabel ? ('Оценка: ' + gradeLabel) : '';
   const x = Math.round(W * 0.04), y1 = H - 56, y2 = H - 22;
   const INK = '#c62828';
   const textStyle = 'font-style="italic" font-weight="bold" paint-order="stroke" stroke="white" stroke-linejoin="round" fill="' + INK + '"';
   let svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' +
     '<g transform="rotate(-2 ' + x + ' ' + y1 + ')">' +
-    '<text x="' + x + '" y="' + y1 + '" font-size="20" stroke-width="4" ' + textStyle + '>' + esc(line1) + '</text>';
+    '<text x="' + x + '" y="' + y1 + '" font-size="24" stroke-width="3.5" ' + textStyle + '>' + esc(line1) + '</text>';
   if (line2) {
-    svg += '<text x="' + x + '" y="' + y2 + '" font-size="24" stroke-width="4.5" ' + textStyle + '>' + esc(line2) + '</text>';
+    svg += '<text x="' + x + '" y="' + y2 + '" font-size="24" stroke-width="3.5" ' + textStyle + '>' + esc(line2) + '</text>';
   }
   svg += '</g></svg>';
   return sharp(imageBuffer).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
@@ -1297,7 +1303,7 @@ async function handleStartGradeWork(body) {
         if (!summaryFilled) {
           for (let i = pages.length - 1; i >= 0; i--) {
             if (!pages[i].buffer) continue;
-            try { pages[i].buffer = await drawSummaryNote_(pages[i].buffer, allTasksOrdered, totalAwarded, maxTotal, gradeLabel); } catch (e) { /* не е фатално */ }
+            try { pages[i].buffer = await drawSummaryNote_(pages[i].buffer, totalAwarded, maxTotal, gradeLabel); } catch (e) { /* не е фатално */ }
             break;
           }
         }
