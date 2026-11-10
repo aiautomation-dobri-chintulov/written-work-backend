@@ -486,9 +486,24 @@ async function fetchSubmissionImage_(drive, accessToken, fileId) {
   const meta = await drive.files.get({ fileId, fields: 'trashed,thumbnailLink' });
   if (meta.data.trashed || !meta.data.thumbnailLink) return null;
   const url = meta.data.thumbnailLink.replace(/=s\d+$/, '=s1200');
-  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } });
-  if (!res.ok) throw new Error('thumbnail HTTP ' + res.status);
-  return Buffer.from(await res.arrayBuffer());
+  // Ретрай (2026-11-10, по реален случай в Render логовете - "fetch failed"
+  // за ВСИЧКИ страници накуп, винаги точно след студен старт/redeploy,
+  // "==> Your service is live" малко преди грешките) - контейнерната мрежа
+  // явно не е напълно готова при първите изходящи заявки веднага след
+  // стартиране. 3 опита с кратко изчакване е достатъчно да прескочи този
+  // прозорец, без да бавя забележимо нормалния (топъл) случай.
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } });
+      if (!res.ok) throw new Error('thumbnail HTTP ' + res.status);
+      return Buffer.from(await res.arrayBuffer());
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+  throw lastErr;
 }
 
 // Прикачените файлове НА САМОТО ЗАДАНИЕ (courseWork.materials - напр. ключ
