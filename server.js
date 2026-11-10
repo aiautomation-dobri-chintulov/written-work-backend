@@ -861,6 +861,7 @@ async function persistGradeStudentResult_(drive, folderId, result) {
   const serializable = {
     name: result.name, userId: result.userId, totalAwarded: result.totalAwarded, maxTotal: result.maxTotal,
     gradeScaleText: result.gradeScaleText, gradeLabel: result.gradeLabel, uploaded: !!result.uploaded,
+    incomplete: !!result.incomplete, // 2026-11-10 - виж бележката при drawSummaryNote_ защо
     updatedAt: new Date().toISOString(),
     pages: (result.pages || []).map((p) => ({
       fileName: p.fileName, error: p.error || null,
@@ -891,7 +892,7 @@ async function readPersistedGradeResults_(drive, folderId) {
       const data = typeof res.data === 'string' ? JSON.parse(res.data) : res.data;
       results.push({
         name: data.name, userId: data.userId, totalAwarded: data.totalAwarded, maxTotal: data.maxTotal,
-        gradeScaleText: data.gradeScaleText, gradeLabel: data.gradeLabel, uploaded: !!data.uploaded,
+        gradeScaleText: data.gradeScaleText, gradeLabel: data.gradeLabel, uploaded: !!data.uploaded, incomplete: !!data.incomplete,
         pages: (data.pages || []).map((p) => ({
           fileName: p.fileName, error: p.error || null,
           buffer: p.bufferBase64 ? Buffer.from(p.bufferBase64, 'base64') : undefined,
@@ -932,16 +933,19 @@ const GRADE_TASK_SCHEMA = {
           maxPoints: { type: 'NUMBER' },
           awardedPoints: { type: 'NUMBER' },
           note: { type: 'STRING' },
-          // 2026-11-09, по изрично искане на потребителя (прегледа подробен
-          // промпт за ръчна проверка, по който бе направен примерът
-          // "Виктория Кирилова.pdf"): КРАТКО вярно решение/отговор, само
-          // когато awardedPoints < maxPoints - НЕ цялостна обосновка
-          // (виж drawGradingOverlay_ защо дължината е ограничена - статично
-          // SVG поле, не истинско PDF писане с преценка за свободно място).
+          // 2026-11-09/10, по изрично искане на потребителя: КРАТКО вярно
+          // решение/отговор - ЗАДЪЛЖИТЕЛНО за ВСЯКА задача (не само при
+          // загубени точки), за да реши Gemini самостоятелно задачата
+          // ПРЕДИ да прецени ученика (вместо да съди "на око") - директен
+          // отговор на реален случай с разминаващи се maxTotal между
+          // ученици от един и същ тест. Показва се на снимката САМО когато
+          // awardedPoints < maxPoints (виж drawGradingOverlay_) - НЕ
+          // цялостна обосновка (статично SVG поле, не истинско PDF писане
+          // с преценка за свободно място).
           correctSolution: { type: 'STRING' },
           box: { type: 'ARRAY', items: { type: 'NUMBER' } },
         },
-        required: ['taskNumber', 'maxPoints', 'awardedPoints', 'box'],
+        required: ['taskNumber', 'maxPoints', 'awardedPoints', 'correctSolution', 'box'],
       },
     },
     gradeScaleText: { type: 'STRING' },
@@ -990,14 +994,14 @@ async function gradeImageWithGemini_(ctx, imageBase64) {
     'За ВСЯКА отпечатана задача на СТРАНИЦАТА:\n' +
     '1. Номер на задачата точно както е отпечатан (напр. "1", "4а", "7").\n' +
     '2. Максимален брой точки - прочети го от отпечатаното "N т." до условието.\n' +
-    '3. Оцени не само крайния отговор, но и правилния подход, показаното разбиране, междинните стъпки и използването на верни термини/единици. Ако ученикът е зачертал решение и го е заменил с друго - оцени ЗАМЕНЯЩОТО (последното, незачертано) решение, не зачертаното. Присъди точки от 0 до максимума (позволени са и половин точки), според тази стъпаловидна скала (освен ако тестът явно дава собствени по-подробни критерии - тогава следвай тях):\n' +
+    '3. "correctSolution" - ПРЕДИ да прецениш ученика, самостоятелно реши задачата (или определи очакваните елементи при отворен въпрос) и запиши ТУК вярното решение/отговор, много кратко (до 25 знака за изчислителни предмети, до 40 знака за хуманитарни) - достатъчно малко, за да се побере на страницата до отговора. Попълвай това поле за ВСЯКА задача, дори когато ученикът е отговорил напълно вярно (нужно е за последователна преценка между различните работи в класа - решавай задачата по един и същ начин всеки път, не отделно "на око" за всеки ученик). При отворени/аргументативни задачи (литература, история, есе) не изисквай единствен възможен отговор - посочи най-важния очакван елемент по критериите, не цяло съчинение.\n' +
+    '4. Едва СЕГА, спрямо вече решеното от теб в "correctSolution" - оцени не само крайния отговор на ученика, но и правилния подход, показаното разбиране, междинните стъпки и използването на верни термини/единици. Ако ученикът е зачертал решение и го е заменил с друго - оцени ЗАМЕНЯЩОТО (последното, незачертано) решение, не зачертаното. Присъди точки от 0 до максимума (позволени са и половин точки), според тази стъпаловидна скала (освен ако тестът явно дава собствени по-подробни критерии - тогава следвай тях):\n' +
     '   - пълен и верен отговор/подход -> пълния брой точки;\n' +
     '   - основно верен отговор с дребна грешка или пропуск -> малко намаление;\n' +
     '   - съществено правилна част, но непълен или частично грешен отговор -> около половината точки;\n' +
     '   - смислено начало или отделен верен елемент -> малък брой точки;\n' +
     '   - липса на каквато и да е релевантна правилна работа -> 0 точки (НЕ присъждай 0, ако има смислена частично вярна работа).\n' +
-    '4. "note" - кратка конкретна бележка (до 8 думи) САМО ако точките са под максимума, по възможност от този тип: "Непълен отговор", "Липсва обосновка", "Фактическа грешка", "Неточна дата", "Объркана причина и следствие", "Грешна единица", "Верен подход, но изчислителна грешка", "Липсва вторият изискван елемент", "няма решение" - или друга също толкова конкретна и кратка.\n' +
-    '5. "correctSolution" - САМО ако точките са под максимума: много кратко (до 25 знака за изчислителни предмети, до 40 знака за хуманитарни) вярното решение/отговор или ключовият липсващ елемент - достатъчно малко, за да се побере на страницата до отговора. При отворени/аргументативни задачи (литература, история, есе) не изисквай единствен възможен отговор - посочи най-важния очакван елемент по критериите, не цяло съчинение.\n' +
+    '5. "note" - кратка конкретна бележка (до 8 думи) САМО ако точките са под максимума, по възможност от този тип: "Непълен отговор", "Липсва обосновка", "Фактическа грешка", "Неточна дата", "Объркана причина и следствие", "Грешна единица", "Верен подход, но изчислителна грешка", "Липсва вторият изискван елемент", "няма решение" - или друга също толкова конкретна и кратка.\n' +
     '6. "box" - нормализирани координати [y_min, x_min, y_max, x_max] в скала 0-1000 спрямо ЦЯЛОТО изображение, сочещи мястото на РЪКОПИСНИЯ ОТГОВОР на ученика за тази задача (не отпечатаното условие).\n\n' +
     'Ако в долната част на страницата има таблица, превръщаща общ брой точки в оценка (напр. "0-8 Слаб2, 9-14 Среден3..."), препиши я като свободен текст в "gradeScaleText".\n' +
     'Ако на страницата има обобщителна таблица с ред "Получени точки" (празни клетки за попълване, по една на задача, плюс клетка "Общо") - за ВСЯКА празна клетка посочи "summaryPointsCells": {"taskNumber": номера на съответната задача, "box": нормализирани координати НА ТАЗИ КОНКРЕТНА празна клетка (не на целия ред)}. Ако има и празна клетка "Общо" в същия ред - посочи координатите ѝ в "summaryTotalBox".\n' +
@@ -1045,6 +1049,7 @@ async function drawGradingOverlay_(imageBuffer, tasks) {
     if (!Array.isArray(t.box) || t.box.length !== 4) return '';
     const p = toPx(t.box);
     const zero = t.awardedPoints <= 0;
+    const incomplete = t.awardedPoints < t.maxPoints;
     const boxH = Math.max(18, p.y1 - p.y0);
     const fontSize = Math.max(18, Math.min(30, Math.round(boxH * 0.55)));
     const cx = p.x1 + Math.round(fontSize * 0.7), cy = p.y0 + Math.round(boxH * 0.5) + Math.round(fontSize * 0.3);
@@ -1065,7 +1070,11 @@ async function drawGradingOverlay_(imageBuffer, tasks) {
     // проверка) - съзнателно кратко (виж gradeImageWithGemini_), тъй като
     // тук НЯМА преценка за свободно място като в истинско PDF писане.
     const smallFont = Math.round(fontSize * 0.42);
-    const extraLines = [t.note ? esc(t.note).slice(0, 40) : '', t.correctSolution ? ('→ ' + esc(t.correctSolution).slice(0, 40)) : ''].filter(Boolean);
+    // 2026-11-10 - correctSolution вече е ЗАДЪЛЖИТЕЛНО поле за ВСЯКА задача
+    // (виж GRADE_TASK_SCHEMA защо), не само при грешка - показваме го на
+    // снимката САМО когато наистина има изгубени точки, иначе ще се появи
+    // излишно и до напълно верните отговори.
+    const extraLines = [t.note ? esc(t.note).slice(0, 40) : '', (incomplete && t.correctSolution) ? ('→ ' + esc(t.correctSolution).slice(0, 40)) : ''].filter(Boolean);
     // Ако cx е близо до десния край на страницата (чести отговори, опрени
     // в полето "РЕШЕНИЕ"), по-дългият текст на бележката/решението просто
     // излизаше извън снимката - 2026-11-09, засечено на реален тест. Закотвяме
@@ -1135,13 +1144,19 @@ async function fillSummaryCells_(imageBuffer, pointsCells, totalBox, totalAwarde
 // без друго е излишна тук - всяка задача вече си има собствена ръкописна
 // марка до отговора (виж drawGradingOverlay_), затова печатът сега показва
 // само общия резултат - по-кратко, нищо тясно за счупване.
-async function drawSummaryNote_(imageBuffer, totalAwarded, maxTotal, gradeLabel) {
+async function drawSummaryNote_(imageBuffer, totalAwarded, maxTotal, gradeLabel, incomplete) {
   const meta = await sharp(imageBuffer).metadata();
   const W = meta.width, H = meta.height;
   const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
   const fmt = (n) => (Math.round(n * 10) / 10).toString();
-  const line1 = 'Общо: ' + fmt(totalAwarded) + ' / ' + fmt(maxTotal);
-  const line2 = gradeLabel ? ('Оценка: ' + gradeLabel) : '';
+  // 2026-11-10, по реален случай ("16/28 при същия тест") - ако страница се
+  // е провалила, totalAwarded/maxTotal са ЧАСТИЧНИ, не истинският максимум
+  // на теста - изрично предупреждение вместо тих грешен брой, за да не
+  // изглежда като различен тест спрямо съучениците.
+  const line1 = incomplete
+    ? ('⚠ НЕПЪЛНО (страница грешка) - засега: ' + fmt(totalAwarded) + ' / ' + fmt(maxTotal))
+    : ('Общо: ' + fmt(totalAwarded) + ' / ' + fmt(maxTotal));
+  const line2 = incomplete ? '' : (gradeLabel ? ('Оценка: ' + gradeLabel) : '');
   const x = Math.round(W * 0.04), y1 = H - 56, y2 = H - 22;
   const INK = '#c62828';
   const textStyle = 'font-style="italic" font-weight="bold" paint-order="stroke" stroke="white" stroke-linejoin="round" fill="' + INK + '"';
@@ -1257,6 +1272,15 @@ async function handleStartGradeWork(body) {
         const pageData = [];
         let totalAwarded = 0, maxTotal = 0, gradeScaleText = '';
         const allTasksOrdered = [];
+        // 2026-11-10, по реален случай ("има работи... при същия брой
+        // максимални точки има оценки... 16/28") - ако СТРАНИЦА се провали
+        // (напр. "fetch failed" при студен старт на Render), задачите ѝ
+        // просто липсваха от сбора по-долу БЕЗ никакъв знак - учителят
+        // виждаше различен (по-нисък) максимум за различни ученици от
+        // ЕДИН И СЪЩ тест, сякаш е различна работа. incomplete проследява
+        // точно това - вижда се изрично в етикета/печата по-долу, вместо
+        // тихо грешен максимум.
+        let incomplete = false;
         for (const att of attachments) {
           try {
             const unmaskedBuf = await fetchSubmissionImage_(drive, driveAccessToken, att.driveFile.id);
@@ -1273,9 +1297,10 @@ async function handleStartGradeWork(body) {
           } catch (e) {
             console.error('[gradeWork] грешка на страница за ' + name + ':', e.message);
             pageData.push({ error: e.message });
+            incomplete = true;
           }
         }
-        const gradeLabel = parseGradeScaleLabel_(gradeScaleText, totalAwarded);
+        const gradeLabel = incomplete ? null : parseGradeScaleLabel_(gradeScaleText, totalAwarded);
         const awardedByTask = {};
         allTasksOrdered.forEach((t) => { awardedByTask[t.taskNumber] = t.awardedPoints; });
 
@@ -1290,7 +1315,10 @@ async function handleStartGradeWork(body) {
           if (pd.error) { pages.push({ fileName: 'стр-' + (pages.length + 1) + '.jpg', error: pd.error }); continue; }
           try {
             let buf = await drawGradingOverlay_(pd.unmaskedBuf, pd.grading.tasks || []);
-            if (pd.grading.summaryPointsCells || pd.grading.summaryTotalBox || pd.grading.summaryGradeBox) {
+            // Не пипаме печатната таблица, ако знаем, че сборът е непълен
+            // (провалена страница) - би попълнила грешен/частичен резултат
+            // точно в официалното поле на листа, по-подвеждащо от липсваща.
+            if (!incomplete && (pd.grading.summaryPointsCells || pd.grading.summaryTotalBox || pd.grading.summaryGradeBox)) {
               buf = await fillSummaryCells_(buf, pd.grading.summaryPointsCells, pd.grading.summaryTotalBox, totalAwarded, pd.grading.summaryGradeBox, gradeLabel, awardedByTask);
               summaryFilled = true;
             }
@@ -1303,12 +1331,12 @@ async function handleStartGradeWork(body) {
         if (!summaryFilled) {
           for (let i = pages.length - 1; i >= 0; i--) {
             if (!pages[i].buffer) continue;
-            try { pages[i].buffer = await drawSummaryNote_(pages[i].buffer, totalAwarded, maxTotal, gradeLabel); } catch (e) { /* не е фатално */ }
+            try { pages[i].buffer = await drawSummaryNote_(pages[i].buffer, totalAwarded, maxTotal, gradeLabel, incomplete); } catch (e) { /* не е фатално */ }
             break;
           }
         }
 
-        const result = { name, userId: sub.userId, totalAwarded, maxTotal, gradeScaleText, gradeLabel, pages, uploaded: false };
+        const result = { name, userId: sub.userId, totalAwarded, maxTotal, gradeScaleText, gradeLabel, pages, uploaded: false, incomplete };
         // Запазва ВЕДНАГА в Drive - преди да върнем от worker-а, не след
         // целия withConcurrency_ - платеният Gemini резултат на ТОЗИ ученик
         // е в безопасност дори ако процесът умре/рестартира на следващия.
@@ -1371,7 +1399,7 @@ async function handleGetPersistedGradeResults(body) {
       ok: true,
       students: results.map((r) => ({
         userId: r.userId, name: r.name, totalAwarded: r.totalAwarded, maxTotal: r.maxTotal,
-        gradeScaleText: r.gradeScaleText, gradeLabel: r.gradeLabel, pageCount: (r.pages || []).length, uploaded: !!r.uploaded,
+        gradeScaleText: r.gradeScaleText, gradeLabel: r.gradeLabel, pageCount: (r.pages || []).length, uploaded: !!r.uploaded, incomplete: !!r.incomplete,
       })),
     };
   } catch (e) {
@@ -1432,7 +1460,7 @@ async function handleListGradeWorkResults(body) {
     }
     return {
       userId: r.userId, name: r.name, totalAwarded: r.totalAwarded, maxTotal: r.maxTotal,
-      gradeScaleText: r.gradeScaleText, gradeLabel: r.gradeLabel, pageCount: (r.pages || []).length, uploaded: !!r.uploaded, previewBase64,
+      gradeScaleText: r.gradeScaleText, gradeLabel: r.gradeLabel, pageCount: (r.pages || []).length, uploaded: !!r.uploaded, incomplete: !!r.incomplete, previewBase64,
     };
   }));
   return { ok: true, students };
