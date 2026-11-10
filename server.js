@@ -807,6 +807,104 @@ function handleGetAnalyzeHomeworkStatus(body) {
 const gradeJobs = new Map();
 const GRADE_CONCURRENCY = 3; // по-нисък от анализа (4) - всяка страница е 2 Gemini извиквания (grading) + повече sharp обработка (overlay)
 
+// --- Трайно пазене на AI проверка в Drive (2026-11-10, по изрично искане
+// на потребителя след реален инцидент - "реално глътна 1 USD, резултата го
+// няма"): gradeJobs по-горе е САМО в паметта на Render - загива при всеки
+// рестарт/заспиване на безплатния instance (виж бележката при
+// fetchSubmissionImage_ за историята с 15-мин idle sleep). Ако връзката
+// прекъсне точно когато jobId-ят умре, вече ПЛАТЕНИЯТ Gemini резултат се
+// губи безвъзвратно и учителят няма как да го види. Решение: всеки
+// завършен ученик се записва ВЕДНАГА в Drive-а на самия учител (не общата
+// _state папка - няма нужда от нов scope, teacherDriveAuth вече го правим
+// за всяко друго четене/писане тук), ключирано по courseWorkId (не по
+// случайния jobId) - "ПРОВЕРКАТА на това задание", не "тази конкретна
+// сесия". Това директно позволява и втората част от искането - "при
+// повторно пускане да може да се изберат кои работи да се проверят":
+// вече готовите ученици просто си стоят във файла, startGradeWork приема
+// onlyUserIds за да плати САМО за избраните, останалите се четат обратно
+// от Drive без нов Gemini разход.
+async function gradeResultsFolderForAssignment_(drive, courseWorkId) {
+  const rootName = 'AI проверки - Писмени работи';
+  let rootId;
+  const rootList = await drive.files.list({ q: `name='${rootName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id)' });
+  if (rootList.data.files && rootList.data.files.length) rootId = rootList.data.files[0].id;
+  else {
+    const created = await drive.files.create({ requestBody: { name: rootName, mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
+    rootId = created.data.id;
+  }
+  const subList = await drive.files.list({ q: `'${rootId}' in parents and name='${courseWorkId}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id)' });
+  if (subList.data.files && subList.data.files.length) return subList.data.files[0].id;
+  const createdSub = await drive.files.create({ requestBody: { name: courseWorkId, mimeType: 'application/vnd.google-apps.folder', parents: [rootId] }, fields: 'id' });
+  return createdSub.data.id;
+}
+
+// Записва/презаписва ЕДИН готов ученик - page буферите се пазят като
+// base64 низове в самия JSON (прост формат, Drive файловете са малки
+// по брой, не е нужен отделен binary storage). Overwrite по userId.json,
+// за да не се трупат дубликати при повторен "Провери избраните".
+async function persistGradeStudentResult_(drive, folderId, result) {
+  const serializable = {
+    name: result.name, userId: result.userId, totalAwarded: result.totalAwarded, maxTotal: result.maxTotal,
+    gradeScaleText: result.gradeScaleText, gradeLabel: result.gradeLabel, uploaded: !!result.uploaded,
+    updatedAt: new Date().toISOString(),
+    pages: (result.pages || []).map((p) => ({
+      fileName: p.fileName, error: p.error || null,
+      bufferBase64: p.buffer ? p.buffer.toString('base64') : null,
+      tasks: p.tasks || [],
+    })),
+  };
+  const fileName = result.userId + '.json';
+  const existing = await drive.files.list({ q: `'${folderId}' in parents and name='${fileName}' and trashed=false`, fields: 'files(id)' });
+  const body = JSON.stringify(serializable);
+  if (existing.data.files && existing.data.files.length) {
+    await drive.files.update({ fileId: existing.data.files[0].id, media: { mimeType: 'application/json', body } });
+  } else {
+    await drive.files.create({ requestBody: { name: fileName, mimeType: 'application/json', parents: [folderId] }, media: { mimeType: 'application/json', body } });
+  }
+}
+
+// Обратното на persistGradeStudentResult_ - връща резултатите в ТОЧНО
+// същата форма, в която ги държи gradeJobs в паметта (buffer-и, не base64),
+// за да може съществуващият код (drawSummaryNote_, confirmUpload и т.н.)
+// да работи еднакво без значение дали данните идват от паметта или от Drive.
+async function readPersistedGradeResults_(drive, folderId) {
+  const list = await drive.files.list({ q: `'${folderId}' in parents and trashed=false and name contains '.json'`, fields: 'files(id,name)' });
+  const results = [];
+  for (const f of (list.data.files || [])) {
+    try {
+      const res = await drive.files.get({ fileId: f.id, alt: 'media' }, { responseType: 'text' });
+      const data = typeof res.data === 'string' ? JSON.parse(res.data) : res.data;
+      results.push({
+        name: data.name, userId: data.userId, totalAwarded: data.totalAwarded, maxTotal: data.maxTotal,
+        gradeScaleText: data.gradeScaleText, gradeLabel: data.gradeLabel, uploaded: !!data.uploaded,
+        pages: (data.pages || []).map((p) => ({
+          fileName: p.fileName, error: p.error || null,
+          buffer: p.bufferBase64 ? Buffer.from(p.bufferBase64, 'base64') : undefined,
+          tasks: p.tasks || [],
+        })),
+      });
+    } catch (e) {
+      console.error('[gradeWork] неуспешно четене на запазен резултат ' + f.name + ':', e.message);
+    }
+  }
+  return results;
+}
+
+async function markGradeStudentUploaded_(drive, folderId, userId) {
+  try {
+    const fileName = userId + '.json';
+    const existing = await drive.files.list({ q: `'${folderId}' in parents and name='${fileName}' and trashed=false`, fields: 'files(id)' });
+    if (!existing.data.files || !existing.data.files.length) return;
+    const fileId = existing.data.files[0].id;
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'text' });
+    const data = typeof res.data === 'string' ? JSON.parse(res.data) : res.data;
+    data.uploaded = true;
+    await drive.files.update({ fileId, media: { mimeType: 'application/json', body: JSON.stringify(data) } });
+  } catch (e) {
+    console.error('[gradeWork] неуспешно маркиране "качено" в Drive за ' + userId + ':', e.message); // не е фатално - качването вече е минало
+  }
+}
+
 const GRADE_TASK_SCHEMA = {
   type: 'OBJECT',
   properties: {
@@ -1058,7 +1156,7 @@ function parseGradeScaleLabel_(scaleText, totalAwarded) {
 function makeGradeJobId_() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
 async function handleStartGradeWork(body) {
-  const { teacherEmail, subject, className, courseId, courseWorkId } = body;
+  const { teacherEmail, subject, className, courseId, courseWorkId, onlyUserIds } = body;
   if (!teacherEmail || !courseId || !courseWorkId) return { error: 'Липсват задължителни данни.' };
   if (!GEMINI_API_KEY) return { error: 'GEMINI_API_KEY не е зададен на Render backend-а.' };
 
@@ -1088,6 +1186,24 @@ async function handleStartGradeWork(body) {
     return { error: 'Грешка при четене на предаванията: ' + describeApiError_(e) };
   }
 
+  // "Провери избраните" (2026-11-10, по изрично искане на потребителя след
+  // реален инцидент с изгубен платен резултат) - onlyUserIds (ако е подаден)
+  // ограничава кои ученици РЕАЛНО минават през Gemini (плаща се само за
+  // тях); останалите се връщат по-долу от вече запазения Drive резултат,
+  // без нов разход. toProcess пази пълния набор submissions само за да
+  // знаем кой НЕ е избран (за да го вземем от Drive накрая).
+  const toProcess = Array.isArray(onlyUserIds) && onlyUserIds.length
+    ? submissions.filter((s) => onlyUserIds.includes(s.userId))
+    : submissions;
+
+  let resultsFolderId;
+  try {
+    const drivePersist = google.drive({ version: 'v3', auth: teacherDriveAuth(teacherEmail) });
+    resultsFolderId = await gradeResultsFolderForAssignment_(drivePersist, courseWorkId);
+  } catch (e) {
+    console.error('[gradeWork] неуспешно подготвяне на Drive папка за трайно пазене (продължавам само с паметта):', describeApiError_(e));
+  }
+
   // Заглавие/описание/прикачени файлове НА САМОТО ЗАДАНИЕ (не грешка, ако
   // не успеем - продължаваме само с ученическата снимка) - 2026-11-09, по
   // изрично искане на потребителя ("да се гледа освен темата и заданието и
@@ -1104,11 +1220,11 @@ async function handleStartGradeWork(body) {
 
   const ctx = { subject: subject || '', className: className || '', assignmentTitle, assignmentDescription, materialImages };
   const jobId = makeGradeJobId_();
-  gradeJobs.set(jobId, { status: 'running', done: 0, total: submissions.length, createdAt: Date.now(), teacherEmail, courseId, courseWorkId, results: [] });
+  gradeJobs.set(jobId, { status: 'running', done: 0, total: toProcess.length, createdAt: Date.now(), teacherEmail, courseId, courseWorkId, results: [] });
 
   (async () => {
     try {
-      const results = await withConcurrency_(submissions, GRADE_CONCURRENCY, async (sub) => {
+      const results = await withConcurrency_(toProcess, GRADE_CONCURRENCY, async (sub) => {
         const name = nameById[sub.userId] || sub.userId;
         const attachments = ((sub.assignmentSubmission || {}).attachments || []).filter((a) => a.driveFile);
 
@@ -1171,13 +1287,42 @@ async function handleStartGradeWork(body) {
           }
         }
 
+        const result = { name, userId: sub.userId, totalAwarded, maxTotal, gradeScaleText, gradeLabel, pages, uploaded: false };
+        // Запазва ВЕДНАГА в Drive - преди да върнем от worker-а, не след
+        // целия withConcurrency_ - платеният Gemini резултат на ТОЗИ ученик
+        // е в безопасност дори ако процесът умре/рестартира на следващия.
+        if (resultsFolderId) {
+          try {
+            const drivePersist = google.drive({ version: 'v3', auth: teacherDriveAuth(teacherEmail) });
+            await persistGradeStudentResult_(drivePersist, resultsFolderId, result);
+          } catch (e) {
+            console.error('[gradeWork] неуспешно трайно запазване за ' + name + ':', describeApiError_(e));
+          }
+        }
         const job = gradeJobs.get(jobId);
         if (job) job.done += 1;
-        return { name, userId: sub.userId, totalAwarded, maxTotal, gradeScaleText, gradeLabel, pages, uploaded: false };
+        return result;
       });
 
+      // "Провери избраните" - студентите, които НЕ бяха избрани за тази
+      // сесия, се връщат от вече запазеното в Drive (без нов Gemini разход),
+      // за да показва "Прегледай" ВИНАГИ целия клас, не само току-що
+      // проверените.
+      let finalResults = results;
+      if (resultsFolderId && toProcess.length !== submissions.length) {
+        try {
+          const drivePersist = google.drive({ version: 'v3', auth: teacherDriveAuth(teacherEmail) });
+          const persisted = await readPersistedGradeResults_(drivePersist, resultsFolderId);
+          const processedIds = new Set(toProcess.map((s) => s.userId));
+          const untouched = persisted.filter((r) => !processedIds.has(r.userId));
+          finalResults = results.concat(untouched);
+        } catch (e) {
+          console.error('[gradeWork] неуспешно обединяване със запазени резултати:', describeApiError_(e));
+        }
+      }
+
       const job = gradeJobs.get(jobId);
-      if (job) { job.results = results; job.status = 'done'; }
+      if (job) { job.results = finalResults; job.status = 'done'; job.total = finalResults.length; }
     } catch (e) {
       console.error('[gradeWork] job ' + jobId + ' гръмна:', e.message);
       gradeJobs.set(jobId, { status: 'error', error: e.message });
@@ -1185,11 +1330,64 @@ async function handleStartGradeWork(body) {
     setTimeout(() => gradeJobs.delete(jobId), 30 * 60 * 1000).unref();
   })();
 
-  return { ok: true, jobId, total: submissions.length };
+  return { ok: true, jobId, total: toProcess.length };
 }
 
-function handleGetGradeWorkStatus(body) {
+// Връща ВЕЧЕ запазени резултати направо от Drive - БЕЗ jobId, не зависи от
+// паметта на Render (виж бележката при gradeResultsFolderForAssignment_).
+// Служи за две неща: (1) зареждане на галерията след прекъсната връзка/
+// рестартирал instance, когато jobId вече е мъртъв; (2) предварителен
+// преглед ПРЕДИ нова проверка - "кои ученици вече имат резултат", за да
+// може учителят да избере само нечетените/провалените за "Провери избраните".
+async function handleGetPersistedGradeResults(body) {
+  const { teacherEmail, courseWorkId } = body;
+  if (!teacherEmail || !courseWorkId) return { error: 'Липсват данни.' };
+  try {
+    const drive = google.drive({ version: 'v3', auth: teacherDriveAuth(teacherEmail) });
+    const folderId = await gradeResultsFolderForAssignment_(drive, courseWorkId);
+    const results = await readPersistedGradeResults_(drive, folderId);
+    return {
+      ok: true,
+      students: results.map((r) => ({
+        userId: r.userId, name: r.name, totalAwarded: r.totalAwarded, maxTotal: r.maxTotal,
+        gradeScaleText: r.gradeScaleText, gradeLabel: r.gradeLabel, pageCount: (r.pages || []).length, uploaded: !!r.uploaded,
+      })),
+    };
+  } catch (e) {
+    return { error: 'Грешка при четене на запазени резултати: ' + describeApiError_(e) };
+  }
+}
+
+// Единна точка за достъп до "задача" - ПЪРВО паметта (бърз път, нормалният
+// случай), а ако jobId вече не съществува там (Render рестартирал/заспал,
+// 30-мин TTL изтекъл - виж бележката при gradeResultsFolderForAssignment_
+// защо това вече не означава загубени данни), FALLBACK директно към Drive,
+// стига клиентът да е подал teacherEmail+courseWorkId (вече ги знае от
+// формата, пазени и преди jobId-то изобщо да съществува). fromMemory:false
+// маркира резултата като "реконструиран" - handleUpdateGradeWorkPage по-долу
+// го ползва, за да знае, че трябва веднага да запише обратно в Drive
+// (мутация върху in-memory копие тук би се загубила след заявката).
+async function resolveGradeJob_(body) {
   const job = gradeJobs.get(body.jobId);
+  if (job) return { job, fromMemory: true, folderId: null };
+  if (!body.teacherEmail || !body.courseWorkId) return { job: null, fromMemory: false, folderId: null };
+  try {
+    const drive = google.drive({ version: 'v3', auth: teacherDriveAuth(body.teacherEmail) });
+    const folderId = await gradeResultsFolderForAssignment_(drive, body.courseWorkId);
+    const results = await readPersistedGradeResults_(drive, folderId);
+    if (!results.length) return { job: null, fromMemory: false, folderId: null };
+    return {
+      job: { status: 'done', done: results.length, total: results.length, teacherEmail: body.teacherEmail, courseId: body.courseId, courseWorkId: body.courseWorkId, results },
+      fromMemory: false, folderId,
+    };
+  } catch (e) {
+    console.error('[gradeWork] неуспешен Drive fallback за jobId ' + body.jobId + ':', describeApiError_(e));
+    return { job: null, fromMemory: false, folderId: null };
+  }
+}
+
+async function handleGetGradeWorkStatus(body) {
+  const { job } = await resolveGradeJob_(body);
   if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
   return { ok: true, status: job.status, done: job.done || 0, total: job.total || 0, error: job.error };
 }
@@ -1199,7 +1397,7 @@ function handleGetGradeWorkStatus(body) {
 // нужда (getGradeWorkPage), за да не блъскаме google.script.run лимита за
 // размер на еднократен отговор с 20+ пълноразмерни анотирани снимки накуп.
 async function handleListGradeWorkResults(body) {
-  const job = gradeJobs.get(body.jobId);
+  const { job } = await resolveGradeJob_(body);
   if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
   if (job.status !== 'done') return { error: 'Задачата още не е готова (статус: ' + job.status + ').' };
   const students = await Promise.all((job.results || []).map(async (r) => {
@@ -1219,8 +1417,8 @@ async function handleListGradeWorkResults(body) {
   return { ok: true, students };
 }
 
-function handleGetGradeWorkPage(body) {
-  const job = gradeJobs.get(body.jobId);
+async function handleGetGradeWorkPage(body) {
+  const { job } = await resolveGradeJob_(body);
   if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
   const r = (job.results || []).find((x) => x.userId === body.userId);
   if (!r) return { error: 'Няма резултат за този ученик.' };
@@ -1238,8 +1436,8 @@ function handleGetGradeWorkPage(body) {
 // просто обновява кеширания job резултат на място, не пипа Classroom/Drive
 // изобщо (това става после, през handleConfirmUploadGradedWork, вече с
 // обновения буфер).
-function handleUpdateGradeWorkPage(body) {
-  const job = gradeJobs.get(body.jobId);
+async function handleUpdateGradeWorkPage(body) {
+  const { job, fromMemory, folderId } = await resolveGradeJob_(body);
   if (!job) return { error: 'Няма такава задача (изтекла или невалидна) - резултатите за тази сесия вече не са налични, стартирай нова AI проверка.' };
   const r = (job.results || []).find((x) => x.userId === body.userId);
   if (!r) return { error: 'Няма резултат за този ученик.' };
@@ -1248,6 +1446,17 @@ function handleUpdateGradeWorkPage(body) {
   if (!body.base64Data) return { error: 'Липсват данни за запис.' };
   page.buffer = Buffer.from(body.base64Data, 'base64');
   delete page.error;
+  // Ако job-ът е реконструиран от Drive (fromMemory:false) - мутацията
+  // по-горе е върху временен обект, който се губи след тази заявка. Записва
+  // ОБРАТНО в Drive веднага, за да не се изгуби "Довърши ръчно" редакцията.
+  if (!fromMemory && folderId) {
+    try {
+      const drive = google.drive({ version: 'v3', auth: teacherDriveAuth(job.teacherEmail) });
+      await persistGradeStudentResult_(drive, folderId, r);
+    } catch (e) {
+      return { error: 'Грешка при запис в Drive: ' + describeApiError_(e) };
+    }
+  }
   return { ok: true };
 }
 
@@ -1262,7 +1471,7 @@ function handleUpdateGradeWorkPage(body) {
 // домейн/service account, потвърдено на живо 2026-11-07) и НЕ по name-match
 // (resolveStudentId_ съществува за друг случай - тук userId вече го имаме).
 async function handleConfirmUploadGradedWork(body) {
-  const job = gradeJobs.get(body.jobId);
+  const { job, folderId } = await resolveGradeJob_(body);
   if (!job) return { error: 'Няма такава задача (изтекла или невалидна).' };
   const r = (job.results || []).find((x) => x.userId === body.userId);
   if (!r) return { error: 'Няма резултат за този ученик.' };
@@ -1301,6 +1510,12 @@ async function handleConfirmUploadGradedWork(body) {
   }
 
   r.uploaded = true;
+  try {
+    const persistFolderId = folderId || await gradeResultsFolderForAssignment_(drive, job.courseWorkId);
+    await markGradeStudentUploaded_(drive, persistFolderId, r.userId);
+  } catch (e) {
+    console.error('[confirmUploadGradedWork] неуспешно маркиране "качено" в Drive (не е фатално):', describeApiError_(e));
+  }
   return { ok: true, note: 'Качени ' + okPages.length + ' страница(и) за ' + r.name + '.' };
 }
 
@@ -1326,11 +1541,12 @@ app.post('/', async (req, res) => {
     if (body.action === 'startHomeworkAnalysis') { res.json(await handleStartAnalyzeHomework(body)); return; }
     if (body.action === 'getHomeworkAnalysisStatus') { res.json(handleGetAnalyzeHomeworkStatus(body)); return; }
     if (body.action === 'startGradeWork') { res.json(await handleStartGradeWork(body)); return; }
-    if (body.action === 'getGradeWorkStatus') { res.json(handleGetGradeWorkStatus(body)); return; }
+    if (body.action === 'getGradeWorkStatus') { res.json(await handleGetGradeWorkStatus(body)); return; }
     if (body.action === 'listGradeWorkResults') { res.json(await handleListGradeWorkResults(body)); return; }
-    if (body.action === 'getGradeWorkPage') { res.json(handleGetGradeWorkPage(body)); return; }
-    if (body.action === 'updateGradeWorkPage') { res.json(handleUpdateGradeWorkPage(body)); return; }
+    if (body.action === 'getGradeWorkPage') { res.json(await handleGetGradeWorkPage(body)); return; }
+    if (body.action === 'updateGradeWorkPage') { res.json(await handleUpdateGradeWorkPage(body)); return; }
     if (body.action === 'confirmUploadGradedWork') { res.json(await handleConfirmUploadGradedWork(body)); return; }
+    if (body.action === 'getPersistedGradeResults') { res.json(await handleGetPersistedGradeResults(body)); return; }
     res.status(400).json({ error: 'непознато action: ' + body.action });
   } catch (e) {
     res.status(500).json({ error: e.message });
