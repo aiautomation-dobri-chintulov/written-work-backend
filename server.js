@@ -138,7 +138,10 @@ async function handleCreateAssignment(body) {
   }
   const result = await classroom.courses.courseWork.create({
     courseId,
-    requestBody: { title, description: description || undefined, workType: 'ASSIGNMENT', state: 'PUBLISHED', topicId: topicId || undefined },
+    // maxPoints: 6 - 2026-11-14, по изрично искане на потребителя (без това
+    // Classroom прилага собствен подразбиращ максимум от 100 точки за всяко
+    // ново задание) - 6 отговаря на българската 2-6 скала за оценяване.
+    requestBody: { title, description: description || undefined, workType: 'ASSIGNMENT', state: 'PUBLISHED', topicId: topicId || undefined, maxPoints: 6 },
   });
   return { ok: true, courseWorkId: result.data.id, topicId: topicId, topicName: topicId ? resolvedTopicName : null };
 }
