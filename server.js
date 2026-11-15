@@ -355,6 +355,84 @@ async function handleGetOriginal(body) {
   }
 }
 
+// Списък на ВСИЧКИ прикачени файлове към предаването (оригинал + всяко
+// по-късно записано анотирано/проверено копие) - 2026-11-15, по изрично
+// искане на потребителя ("когато искам да заредя вече анотирана качена
+// работа ми зарежда оригиналната - нека да може да се избира коя работа да
+// се анотира"): handleGetOriginal по-горе ВИНАГИ отваря ПОСЛЕДНИЯ прикачен
+// файл по подразбиране - добре като удобство, но AI-проверката
+// (handleConfirmUploadGradedWork) прикача ВСЯКА страница като ОТДЕЛЕН Drive
+// файл, затова "последният" там е само последната страница от AI резултата,
+// не целият анотиран документ - учителят трябва да може явно да види и
+// избере измежду всички прикачени версии, не само да приема automatичната
+// гадаене "последният = правилният".
+async function handleListSubmissionAttachments(body) {
+  const { teacherEmail, courseId, courseWorkId, studentEmail, studentName } = body;
+  const tag = '[listAttachments ' + studentEmail + ']';
+  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail || !studentName) {
+    return { error: 'Липсват задължителни полета.' };
+  }
+
+  const auth = teacherDriveAuth(teacherEmail);
+  const classroom = google.classroom({ version: 'v1', auth });
+  const drive = google.drive({ version: 'v3', auth });
+
+  let submission;
+  try {
+    const studentId = await resolveStudentId_(google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) }), courseId, studentName);
+    const res = await classroom.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId, userId: studentId });
+    submission = (res.data.studentSubmissions || [])[0] || null;
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при четене на submission:', describeApiError_(e));
+    return { error: 'Грешка при четене на submission: ' + describeApiError_(e) };
+  }
+  if (!submission) return { error: 'Няма предаване за ' + studentEmail + ' в тази задача.' };
+
+  const attachments = (submission.assignmentSubmission && submission.assignmentSubmission.attachments) || [];
+  const driveAttachments = attachments.filter((a) => a.driveFile);
+  if (driveAttachments.length === 0) return { error: 'Предаването няма прикачени файлове.' };
+
+  const out = [];
+  for (let i = 0; i < driveAttachments.length; i++) {
+    const fileId = driveAttachments[i].driveFile.id;
+    try {
+      const meta = await drive.files.get({ fileId, fields: 'name,mimeType,trashed,modifiedTime' });
+      if (meta.data.trashed) continue; // изтрито копие - не го предлагаме за избор
+      out.push({
+        driveFileId: fileId, fileName: meta.data.name, mimeType: meta.data.mimeType,
+        modifiedTime: meta.data.modifiedTime, isOriginal: i === 0,
+      });
+    } catch (e) {
+      console.error(tag, 'прескачам нечетимо копие (' + fileId + '):', describeApiError_(e));
+    }
+  }
+  if (out.length === 0) return { error: 'Нито едно от прикачените копия не може да се прочете.' };
+  return { ok: true, attachments: out };
+}
+
+// Изтегля ЕДНО конкретно, изрично избрано от учителя прикачване по
+// driveFileId (виж handleListSubmissionAttachments по-горе) - за разлика от
+// handleGetOriginal, тук няма "познаване" кое копие е правилното, клиентът
+// вече го е избрал явно.
+async function handleGetAttachment(body) {
+  const { teacherEmail, driveFileId } = body;
+  const tag = '[getAttachment ' + driveFileId + ']';
+  if (!teacherEmail || !driveFileId) return { error: 'Липсват задължителни полета.' };
+
+  const auth = teacherDriveAuth(teacherEmail);
+  const drive = google.drive({ version: 'v3', auth });
+  try {
+    const meta = await drive.files.get({ fileId: driveFileId, fields: 'name,mimeType,trashed' });
+    if (meta.data.trashed) return { error: 'Файлът е в кошчето.' };
+    const content = await drive.files.get({ fileId: driveFileId, alt: 'media' }, { responseType: 'arraybuffer' });
+    const base64Data = Buffer.from(content.data).toString('base64');
+    return { ok: true, fileName: meta.data.name, mimeType: meta.data.mimeType, base64Data, driveFileId };
+  } catch (e) {
+    console.error(tag, 'ГРЕШКА при изтегляне:', describeApiError_(e));
+    return { error: 'Грешка при изтегляне на файла: ' + describeApiError_(e) };
+  }
+}
+
 // Презаписва СЪЩИЯ вече прикачен файл (анотирано копие от предишна сесия) -
 // за разлика от handleAttachGraded (който ДОБАВЯ нов файл), тук е просто
 // Drive files.update върху известен fileId - не пипа Classroom
@@ -1588,6 +1666,8 @@ app.post('/', async (req, res) => {
     if (body.action === 'submitWork') { res.json(await handleSubmitWork(body)); return; }
     if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
     if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
+    if (body.action === 'listAttachments') { res.json(await handleListSubmissionAttachments(body)); return; }
+    if (body.action === 'getAttachment') { res.json(await handleGetAttachment(body)); return; }
     if (body.action === 'listCourseWork') { res.json(await handleListCourseWork(body)); return; }
     if (body.action === 'updateAnnotated') { res.json(await handleUpdateAnnotated(body)); return; }
     if (body.action === 'startHomeworkAnalysis') { res.json(await handleStartAnalyzeHomework(body)); return; }
