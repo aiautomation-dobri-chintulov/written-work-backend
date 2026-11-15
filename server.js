@@ -289,83 +289,16 @@ async function handleAttachGraded(body) {
   return { ok: true, driveFileId: uploaded.data.id };
 }
 
-// Изтегля оригинално предадения файл обратно от Classroom (за редактора за
-// анотиране - учителят анотира ТОВА, не презаписва нищо) - 2026-11-07, по
-// изрично искане на потребителя (Път 3: "учителя директно да анотира
-// работата... оригиналната работа трябва да остане непипана"). Чете
-// ПЪРВИЯ Drive файл от прикачените в предаването (оригиналът, предаден от
-// ученика в Stage 1 - по-късно прикачени проверени копия идват след него).
-// Импersonating учителя (СЪЩИЯТ auth като attachGraded - само той има
-// право да чете прикаченото след turnIn).
-async function handleGetOriginal(body) {
-  const { teacherEmail, courseId, courseWorkId, studentEmail, studentName } = body;
-  const tag = '[getOriginal ' + studentEmail + ']';
-  if (!teacherEmail || !courseId || !courseWorkId || !studentEmail || !studentName) {
-    return { error: 'Липсват задължителни полета.' };
-  }
-
-  const auth = teacherDriveAuth(teacherEmail);
-  const classroom = google.classroom({ version: 'v1', auth });
-  const drive = google.drive({ version: 'v3', auth });
-
-  let submission;
-  try {
-    const studentId = await resolveStudentId_(google.classroom({ version: 'v1', auth: rosterAuth(teacherEmail) }), courseId, studentName);
-    const res = await classroom.courses.courseWork.studentSubmissions.list({ courseId, courseWorkId, userId: studentId });
-    submission = (res.data.studentSubmissions || [])[0] || null;
-  } catch (e) {
-    console.error(tag, 'ГРЕШКА при четене на submission:', describeApiError_(e));
-    return { error: 'Грешка при четене на submission: ' + describeApiError_(e) };
-  }
-  if (!submission) return { error: 'Няма предаване за ' + studentEmail + ' в тази задача.' };
-
-  const attachments = (submission.assignmentSubmission && submission.assignmentSubmission.attachments) || [];
-  const driveAttachments = attachments.filter((a) => a.driveFile);
-  if (driveAttachments.length === 0) return { error: 'Предаването няма прикачени файлове.' };
-  // ПОСЛЕДНИЯТ прикачен файл - 2026-11-07, по изрично искане на потребителя
-  // ("ще може ли анотирана работа повторно да се анотира"): оригиналът е
-  // attachments[0] (от Stage 1), всяко следващо "Запази анотираното копие"
-  // (attachGraded) ДОБАВЯ нов файл в края - затова последният елемент е
-  // ВИНАГИ най-актуалната версия (оригинал, ако още няма анотации; иначе
-  // последното анотирано копие) - учителят продължава откъдето е спрял,
-  // вместо винаги да вижда чист оригинал.
-  //
-  // ПАДАНЕ НАЗАД при счупена връзка - 2026-11-07, по изрично искане на
-  // потребителя ("ако изтрия грешно анотирана работа в класрум, ще се
-  // отвори ли оригиналната работа"): ако последният файл е изтрит/преместен
-  // в кошчето В Drive (без да е detach-нат от Classroom - detach-ването
-  // само по себе си вече се вижда коректно, защото просто смалява
-  // driveAttachments), опитваме по-ранните прикачвания един по един, до
-  // оригинала - учителят никога не остава без работещ файл само защото
-  // едно НЕПРАВИЛНО копие е счупено.
-  for (let i = driveAttachments.length - 1; i >= 0; i--) {
-    const fileId = driveAttachments[i].driveFile.id;
-    const isOriginal = i === 0;
-    try {
-      const meta = await drive.files.get({ fileId, fields: 'name,mimeType,trashed' });
-      if (meta.data.trashed) throw new Error('файлът е в кошчето');
-      const content = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
-      const base64Data = Buffer.from(content.data).toString('base64');
-      return { ok: true, fileName: meta.data.name, mimeType: meta.data.mimeType, base64Data, driveFileId: fileId, isOriginal: isOriginal };
-    } catch (e) {
-      console.error(tag, 'прескачам счупено копие (' + fileId + '):', describeApiError_(e));
-      if (i === 0) return { error: 'Грешка при изтегляне на файла: ' + describeApiError_(e) };
-      // иначе - продължава към предишното (по-старо) прикачване
-    }
-  }
-}
-
 // Списък на ВСИЧКИ прикачени файлове към предаването (оригинал + всяко
 // по-късно записано анотирано/проверено копие) - 2026-11-15, по изрично
 // искане на потребителя ("когато искам да заредя вече анотирана качена
 // работа ми зарежда оригиналната - нека да може да се избира коя работа да
-// се анотира"): handleGetOriginal по-горе ВИНАГИ отваря ПОСЛЕДНИЯ прикачен
-// файл по подразбиране - добре като удобство, но AI-проверката
-// (handleConfirmUploadGradedWork) прикача ВСЯКА страница като ОТДЕЛЕН Drive
-// файл, затова "последният" там е само последната страница от AI резултата,
-// не целият анотиран документ - учителят трябва да може явно да види и
-// избере измежду всички прикачени версии, не само да приема automatичната
-// гадаене "последният = правилният".
+// се анотира"): по-рано редакторът автоматично отваряше ПОСЛЕДНИЯ прикачен
+// файл - добре като удобство, но AI-проверката (handleConfirmUploadGradedWork)
+// прикача ВСЯКА страница като ОТДЕЛЕН Drive файл, затова "последният" там е
+// само последната страница от AI резултата, не целият анотиран документ -
+// учителят трябва да може явно да види и избере измежду всички прикачени
+// версии, не само да приема автоматичното гадаене "последният = правилният".
 async function handleListSubmissionAttachments(body) {
   const { teacherEmail, courseId, courseWorkId, studentEmail, studentName } = body;
   const tag = '[listAttachments ' + studentEmail + ']';
@@ -411,9 +344,8 @@ async function handleListSubmissionAttachments(body) {
 }
 
 // Изтегля ЕДНО конкретно, изрично избрано от учителя прикачване по
-// driveFileId (виж handleListSubmissionAttachments по-горе) - за разлика от
-// handleGetOriginal, тук няма "познаване" кое копие е правилното, клиентът
-// вече го е избрал явно.
+// driveFileId (виж handleListSubmissionAttachments по-горе) - тук няма
+// "познаване" кое копие е правилното, клиентът вече го е избрал явно.
 async function handleGetAttachment(body) {
   const { teacherEmail, driveFileId } = body;
   const tag = '[getAttachment ' + driveFileId + ']';
@@ -1665,7 +1597,6 @@ app.post('/', async (req, res) => {
     if (body.action === 'listTopics') { res.json(await handleListTopics(body)); return; }
     if (body.action === 'submitWork') { res.json(await handleSubmitWork(body)); return; }
     if (body.action === 'attachGraded') { res.json(await handleAttachGraded(body)); return; }
-    if (body.action === 'getOriginal') { res.json(await handleGetOriginal(body)); return; }
     if (body.action === 'listAttachments') { res.json(await handleListSubmissionAttachments(body)); return; }
     if (body.action === 'getAttachment') { res.json(await handleGetAttachment(body)); return; }
     if (body.action === 'listCourseWork') { res.json(await handleListCourseWork(body)); return; }
