@@ -31,10 +31,19 @@ const SHARED_SECRET = process.env.SHARED_SECRET;
 const key = JSON.parse(process.env.SERVICE_ACCOUNT_KEY_JSON);
 const PORT = process.env.PORT || 3000;
 
+// ВАЖНО (поправка 2026-11-25, реален бъг - "стара тема не се показва, нова
+// тема не се създава"): courses.topics.list/.create изискват ОТДЕЛЕН scope
+// (classroom.topics), различен от classroom.coursework.students - не е
+// обхванат от него въпреки документацията да звучи сякаш е така (виж по-
+// старата, тогава неизяснена бележка при handleCreateAssignment/
+// describeApiError_ - "Insufficient Permission", открито 2026-11-07, но
+// заобиколено с тих catch вместо отстранено). Без този scope, И
+// courses.topics.list, И courses.topics.create гърмят тихо - темите никога
+// не се показват/създават, дори потребителят да избере "+ нова тема...".
 function teacherCourseworkAuth(email) {
   return new google.auth.JWT({
     email: key.client_email, key: key.private_key, subject: email,
-    scopes: ['https://www.googleapis.com/auth/classroom.coursework.students'],
+    scopes: ['https://www.googleapis.com/auth/classroom.coursework.students', 'https://www.googleapis.com/auth/classroom.topics'],
   });
 }
 
