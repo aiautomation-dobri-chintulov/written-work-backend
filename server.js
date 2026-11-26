@@ -126,7 +126,7 @@ async function resolveTopicId_(classroom, courseId, topicName) {
 }
 
 async function handleCreateAssignment(body) {
-  const { teacherEmail, courseId, title, description, topicName } = body;
+  const { teacherEmail, courseId, title, description, topicName, scheduledTime } = body;
   if (!teacherEmail || !courseId || !title) return { error: 'Липсва teacherEmail/courseId/title.' };
   const classroom = google.classroom({ version: 'v1', auth: teacherCourseworkAuth(teacherEmail) });
   let topicId = null;
@@ -141,18 +141,33 @@ async function handleCreateAssignment(body) {
       // причина, въпреки че Classroom API документацията изброява СЪЩИЯ
       // scope като за courseWork.create/list) - не искаме да провалим
       // ЦЯЛОТО създаване на заданието заради проблем само с темата -
-      // създаваме БЕЗ тема вместо да спрем всичко.
+      // създаваме БЕЗ тема вместо да спрем всичко. ПОПРАВЕНО 2026-11-25 -
+      // истинската причина беше липсващ classroom.topics scope, не нещо
+      // неизяснено - виж teacherCourseworkAuth по-горе. Catch-ът остава
+      // като защита (напр. временен мрежов проблем), не е основният път вече.
       console.error('[createAssignment] неуспешно задаване на тема (продължавам без тема):', describeApiError_(e));
     }
   }
-  const result = await classroom.courses.courseWork.create({
-    courseId,
+  // Отложено публикуване (по избор, 2026-11-26, по изрично искане на
+  // потребителя) - Classroom поддържа нативно state=DRAFT + scheduledTime
+  // (RFC3339 UTC, вече изчислен клиентски): автоматично минава в PUBLISHED
+  // в зададения момент, без нужда от собствен тригер/cron тук. Без
+  // scheduledTime - поведението си остава непроменено (веднага PUBLISHED).
+  const isScheduled = !!(scheduledTime && String(scheduledTime).trim());
+  const requestBody = {
+    title,
+    description: description || undefined,
+    workType: 'ASSIGNMENT',
     // maxPoints: 6 - 2026-11-14, по изрично искане на потребителя (без това
     // Classroom прилага собствен подразбиращ максимум от 100 точки за всяко
     // ново задание) - 6 отговаря на българската 2-6 скала за оценяване.
-    requestBody: { title, description: description || undefined, workType: 'ASSIGNMENT', state: 'PUBLISHED', topicId: topicId || undefined, maxPoints: 6 },
-  });
-  return { ok: true, courseWorkId: result.data.id, topicId: topicId, topicName: topicId ? resolvedTopicName : null };
+    maxPoints: 6,
+    topicId: topicId || undefined,
+    state: isScheduled ? 'DRAFT' : 'PUBLISHED',
+  };
+  if (isScheduled) requestBody.scheduledTime = scheduledTime;
+  const result = await classroom.courses.courseWork.create({ courseId, requestBody });
+  return { ok: true, courseWorkId: result.data.id, topicId: topicId, topicName: topicId ? resolvedTopicName : null, scheduledTime: isScheduled ? scheduledTime : null };
 }
 
 // Връща темите, вече създадени в курса - за падащото меню "Тема" при ново
